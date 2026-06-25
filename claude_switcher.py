@@ -9,9 +9,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 CONFIG_FILE   = os.path.expanduser("~/.cc_routes.json")
 SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
+OAUTH_FILE    = os.path.expanduser("~/.claude/claude.json")
+CLAWGOD_FILE = os.path.expanduser("~/.clawgod/provider.json")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_TABLE_FILE = os.path.join(APP_DIR, "model_test_tables.json")
 DEFAULT_ROUTE_KEY = "__default__"
@@ -100,7 +103,22 @@ DEFAULT_MODEL_ROWS = [
 # ── 系统环境变量读写（用户级）────────────────────────────────────────────────
 
 REG_PATH = r"Environment"  # HKCU\Environment
-
+def sync_clawgod_warlord(route):
+    """同步 ClawGod provider.json；注意 ClawGod 当前会同时注入 API_KEY 和 AUTH_TOKEN。"""
+    is_oauth = bool(route.get("oauth_json", "").strip())
+    provider_data = {
+        "apiKey": "" if is_oauth else route.get("api_key", ""),
+        "baseURL": "" if is_oauth else route.get("base_url", ""),
+        "model": route.get("model", ""),
+        "smallModel": "",
+        "timeoutMs": 3000000,
+    }
+    try:
+        os.makedirs(os.path.dirname(CLAWGOD_FILE), exist_ok=True)
+        with open(CLAWGOD_FILE, "w", encoding="utf-8") as f:
+            json.dump(provider_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 def _get_user_env(name):
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH) as k:
@@ -133,21 +151,100 @@ def _del_user_env(name):
 def get_global_route():
     return _get_user_env("ANTHROPIC_BASE_URL")
 
+def route_auth_var(route):
+    value = (route.get("auth_var") or "").strip().upper()
+    if value in ("ANTHROPIC_API_KEY", "API_KEY"):
+        return "ANTHROPIC_API_KEY"
+    return "ANTHROPIC_AUTH_TOKEN"
+
+def apply_api_auth(env, api_key, auth_var):
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    if not api_key:
+        return
+    env[auth_var] = api_key
+
+def build_shell_env(route):
+    """Build the same Claude env vars used by the global switcher."""
+    env = {}
+    clears = {
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+    }
+    if not route.get("oauth_json") and route.get("base_url"):
+        env["ANTHROPIC_BASE_URL"] = route["base_url"]
+    if route.get("model"):
+        env["ANTHROPIC_MODEL"] = route["model"]
+    if not route.get("oauth_json") and route.get("api_key"):
+        env[route_auth_var(route)] = route["api_key"]
+    return env, clears - set(env)
+
+def build_powershell_env_command(route):
+    env, clears = build_shell_env(route)
+    parts = [f"Remove-Item Env:{name} -ErrorAction SilentlyContinue" for name in sorted(clears)]
+    for name, value in env.items():
+        escaped = str(value).replace("'", "''")
+        parts.append(f"$env:{name}='{escaped}'")
+    return "; ".join(parts)
+
+def clean_claude_launch_env(env):
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CONFIG_DIR",
+    ):
+        env.pop(name, None)
+
 def apply_global(route):
-    if route.get("base_url"):
+    # 1. Base URL
+    if route.get("oauth_json"):
+        _del_user_env("ANTHROPIC_BASE_URL")  # 核心病灶解药：只要是Pro号，天王老子来了也得把BaseURL删空！
+    elif route.get("base_url"):
         _set_user_env("ANTHROPIC_BASE_URL", route["base_url"])
     else:
         _del_user_env("ANTHROPIC_BASE_URL")
-    if route.get("api_key"):
-        _set_user_env("ANTHROPIC_API_KEY", route["api_key"])
+
+    # 2. Model
     if route.get("model"):
         _set_user_env("ANTHROPIC_MODEL", route["model"])
     else:
         _del_user_env("ANTHROPIC_MODEL")
 
+    # 3. 互斥铁律：有OAuth JSON时，物理歼灭API Key变量；无OAuth时，按路线选择注入 AUTH_TOKEN / API_KEY 之一
+    if route.get("oauth_json"):
+        _del_user_env("ANTHROPIC_API_KEY")
+        _del_user_env("ANTHROPIC_AUTH_TOKEN")
+    else:
+        if route.get("api_key"):
+            auth_var = route_auth_var(route)
+            other_var = "ANTHROPIC_API_KEY" if auth_var == "ANTHROPIC_AUTH_TOKEN" else "ANTHROPIC_AUTH_TOKEN"
+            _set_user_env(auth_var, route["api_key"])
+            _del_user_env(other_var)
+        else:
+            _del_user_env("ANTHROPIC_API_KEY")
+            _del_user_env("ANTHROPIC_AUTH_TOKEN")
+
 def clear_global():
     _del_user_env("ANTHROPIC_BASE_URL")
     _del_user_env("ANTHROPIC_MODEL")
+    _del_user_env("ANTHROPIC_API_KEY")
+    _del_user_env("ANTHROPIC_AUTH_TOKEN")
+    settings = load_settings()
+    env = settings.setdefault("env", {})
+    env.pop("ANTHROPIC_BASE_URL", None)
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    settings.pop("model", None)
+    save_settings(settings)
+    if os.path.exists(OAUTH_FILE):
+        try: os.remove(OAUTH_FILE)
+        except: pass
 
 
 # ── settings.json 读写 ────────────────────────────────────────────────────────
@@ -167,17 +264,26 @@ def save_settings(settings):
         json.dump(settings, f, ensure_ascii=False, indent=2)
 
 def sync_settings(route):
-    """将路线的 base_url / api_key / model 同步写入 ~/.claude/settings.json"""
+    """将路线同步写入 ~/.claude/settings.json，并隔离 API Key / OAuth 两种认证模式"""
     settings = load_settings()
     env = settings.setdefault("env", {})
+    is_oauth = bool(route.get("oauth_json", "").strip())
 
-    if route.get("base_url"):
+    if is_oauth:
+        env.pop("ANTHROPIC_BASE_URL", None)
+    elif route.get("base_url"):
         env["ANTHROPIC_BASE_URL"] = route["base_url"]
     else:
         env.pop("ANTHROPIC_BASE_URL", None)
 
-    if route.get("api_key"):
-        env["ANTHROPIC_AUTH_TOKEN"] = route["api_key"]
+    if is_oauth:
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    elif route.get("api_key"):
+        apply_api_auth(env, route["api_key"], route_auth_var(route))
+    else:
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
 
     if route.get("model"):
         settings["model"] = route["model"]
@@ -187,7 +293,29 @@ def sync_settings(route):
 def read_settings_model():
     return load_settings().get("model", "")
 
+def sync_oauth_identity(route):
+    """核心引擎：在「原生Pro会员模式」与「API Key中转模式」之间进行物理隔离"""
+    oauth_data = route.get("oauth_json", "").strip()
 
+    if oauth_data:
+        # 用户贴入了 CPA 吐出的纯血 JSON 文本
+        try:
+            data = json.loads(oauth_data)
+            if "access_token" in data:
+                os.makedirs(os.path.dirname(OAUTH_FILE), exist_ok=True)
+                with open(OAUTH_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                return True
+        except Exception as e:
+            messagebox.showerror("OAuth JSON 解析失败", f"请检查粘贴的 CPA 文本格式:\n{e}")
+    else:
+        # 凡是普通 API 路线，必须物理超度 claude.json，否则 SDK 会死锁在旧 Session 上！
+        if os.path.exists(OAUTH_FILE):
+            try:
+                os.remove(OAUTH_FILE)
+            except Exception:
+                pass
+    return False
 # ── 路线持久化 ────────────────────────────────────────────────────────────────
 
 def load_routes():
@@ -195,19 +323,43 @@ def load_routes():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 routes = json.load(f)
+            changed = False
             for r in routes:
                 r.setdefault("model", "")
+                r.setdefault("auth_var", "ANTHROPIC_AUTH_TOKEN")
+                if not r.get("table_id"):
+                    ensure_route_table_id(r)
+                    changed = True
+            if changed:
+                save_routes(routes)
             return routes
         except Exception:
             pass
-    return [r.copy() for r in DEFAULT_ROUTES]
+    routes = [r.copy() for r in DEFAULT_ROUTES]
+    for r in routes:
+        ensure_route_table_id(r)
+    return routes
 
 def save_routes(routes):
+    for route in routes:
+        ensure_route_table_id(route)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(routes, f, ensure_ascii=False, indent=2)
 
 
+def ensure_route_table_id(route):
+    table_id = route.get("table_id", "")
+    if not table_id:
+        table_id = f"route-{uuid.uuid4().hex[:12]}"
+        route["table_id"] = table_id
+    return table_id
+
+
 def route_table_key(route):
+    return ensure_route_table_id(route)
+
+
+def legacy_route_table_key(route):
     name = route.get("name", "").strip() or "未命名"
     base_url = route.get("base_url", "").strip()
     return f"{name}@@{base_url}"
@@ -269,10 +421,16 @@ def save_model_tables(data):
 def get_model_rows_for_route(route):
     data = load_model_tables()
     tables = data.setdefault("tables", {})
+    meta = data.setdefault("meta", {})
     key = route_table_key(route)
+    legacy_key = legacy_route_table_key(route)
     if key not in tables:
-        tables[key] = [normalize_model_row(row) for row in tables.get(DEFAULT_ROUTE_KEY, DEFAULT_MODEL_ROWS)]
-        save_model_tables(data)
+        if legacy_key in tables:
+            tables[key] = tables.pop(legacy_key)
+        else:
+            tables[key] = [normalize_model_row(row) for row in tables.get(DEFAULT_ROUTE_KEY, DEFAULT_MODEL_ROWS)]
+    meta.setdefault(key, {})
+    save_model_tables(data)
     return data, key, tables[key]
 
 
@@ -292,14 +450,56 @@ def price_display(value):
     return f"{number:g}"
 
 
+def error_display(value, max_len=80):
+    text = str(value or "").replace("\n", " ").strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 1] + "…"
+
+
 def build_anthropic_messages_url(base_url):
-    base = (base_url or "https://api.anthropic.com").rstrip("/")
+    base = (base_url or "https://api.anthropic.com").strip().rstrip("/")
+    if base.endswith("/v1/messages") or base.endswith("/messages"):
+        return base
     if base.endswith("/v1"):
         return f"{base}/messages"
     return f"{base}/v1/messages"
 
 
+def build_test_headers(route, api_key):
+    headers = {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+    }
+    if route_auth_var(route) == "ANTHROPIC_API_KEY":
+        headers["x-api-key"] = api_key
+    else:
+        headers["authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def short_test_error(exc, body=""):
+    if isinstance(exc, urllib.error.HTTPError):
+        hints = {
+            401: "认证失败：检查 Key 或认证变量",
+            402: "额度不足：需要充值或提高 Key 预算",
+            403: "无权限：该 Key 不支持这个模型/渠道",
+            404: "接口或模型不存在：检查 Base URL 和模型名",
+            429: "限流：稍后重试或降低测试数量",
+            500: "上游报错：多半是渠道异常或不支持该模型",
+            502: "上游不可用：稍后重试",
+            524: "上游超时：模型慢或中转站超时",
+        }
+        hint = hints.get(exc.code, "请求失败")
+        return f"HTTP {exc.code} {hint}: {body[:300]}"
+    if isinstance(exc, TimeoutError):
+        return "请求超时：模型慢或中转站无响应"
+    return str(exc)
+
+
 def test_model(route, model, timeout=30):
+    if route.get("oauth_json"):
+        return False, "", "模型表测试只支持 API Key 路线，不支持 Pro OAuth 路线"
     api_key = route.get("api_key") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     if not api_key:
         return False, "", "缺少 API Key"
@@ -311,28 +511,26 @@ def test_model(route, model, timeout=30):
         "messages": [{"role": "user", "content": "Reply OK only."}],
     }
     data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "content-type": "application/json",
-            "x-api-key": api_key,
-            "authorization": f"Bearer {api_key}",
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
+    headers = build_test_headers(route, api_key)
     start = time.time()
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read(4096).decode("utf-8", errors="replace")
-        latency = int((time.time() - start) * 1000)
-        return True, latency, body[:300]
-    except urllib.error.HTTPError as exc:
-        body = exc.read(2048).decode("utf-8", errors="replace")
-        return False, "", f"HTTP {exc.code}: {body[:300]}"
-    except Exception as exc:
-        return False, "", str(exc)
+    last_error = ""
+    for attempt in range(2):
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read(4096).decode("utf-8", errors="replace")
+            latency = int((time.time() - start) * 1000)
+            return True, latency, body[:300]
+        except urllib.error.HTTPError as exc:
+            body = exc.read(2048).decode("utf-8", errors="replace")
+            last_error = short_test_error(exc, body)
+            if exc.code not in (502, 524) or attempt:
+                return False, "", last_error
+            time.sleep(1)
+        except Exception as exc:
+            last_error = short_test_error(exc)
+            break
+    return False, "", last_error
 
 
 # ── 编辑/新增对话框 ───────────────────────────────────────────────────────────
@@ -344,35 +542,45 @@ class RouteEditor(tk.Toplevel):
         self.resizable(False, False)
         self.result = None
 
-        route = route or {"name": "", "base_url": "", "api_key": "", "model": "", "note": ""}
+        route = route or {"name": "", "base_url": "", "api_key": "", "auth_var": "ANTHROPIC_AUTH_TOKEN", "oauth_json": "", "model": "", "note": ""}
 
+        # 核心解药：只有 api_key 设为 True（密码），oauth_json 设为 False（绝对明文）
         fields = [
-            ("名称 *",               "name",     False),
-            ("ANTHROPIC_BASE_URL",   "base_url", False),
-            ("ANTHROPIC_AUTH_TOKEN", "api_key",  True),
-            ("model（留空不覆盖）",   "model",    False),
-            ("备注",                 "note",     False),
+            ("名称 *",               "name",       False),
+            ("ANTHROPIC_BASE_URL",   "base_url",   False),
+            ("Key密钥",               "api_key",    True),   # <-- 只有它是 True
+            ("认证变量",              "auth_var",   False),
+            ("Pro凭证(CPA JSON)",     "oauth_json", False), # <-- 绝对明文，不再遮挡
+            ("model（留空不覆盖）",   "model",      False),
+            ("备注",                 "note",       False),
         ]
-
         self.vars = {}
         self._key_entry = None
 
         for i, (label, key, secret) in enumerate(fields):
-            tk.Label(self, text=label, anchor="w", width=24).grid(
-                row=i, column=0, padx=(12, 4), pady=6, sticky="w"
-            )
+            tk.Label(self, text=label, anchor="w", width=24).grid(row=i, column=0, padx=(12, 4), pady=6, sticky="w")
             var = tk.StringVar(value=route.get(key, ""))
-            entry = tk.Entry(self, textvariable=var, width=42)
-            if secret:
+            if key == "auth_var":
+                entry = ttk.Combobox(
+                    self,
+                    textvariable=var,
+                    width=39,
+                    state="readonly",
+                    values=("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"),
+                )
+            else:
+                entry = tk.Entry(self, textvariable=var, width=42)
+            
+            if key == "api_key":
                 entry.config(show="*")
                 self._key_entry = entry
+                # 把小眼睛精准焊死在 api_key 这一行（第2行）
+                tk.Button(self, text="👁", width=3, command=self._toggle_key).grid(row=i, column=2, padx=(0, 8))
+                
             entry.grid(row=i, column=1, padx=(4, 4), pady=6)
             self.vars[key] = var
 
         self._show_key = False
-        tk.Button(self, text="👁", width=3, command=self._toggle_key).grid(
-            row=2, column=2, padx=(0, 8)
-        )
 
         btn_frame = tk.Frame(self)
         btn_frame.grid(row=len(fields), column=0, columnspan=3, pady=(8, 12))
@@ -384,7 +592,8 @@ class RouteEditor(tk.Toplevel):
 
     def _toggle_key(self):
         self._show_key = not self._show_key
-        self._key_entry.config(show="" if self._show_key else "*")
+        if self._key_entry:
+            self._key_entry.config(show="" if self._show_key else "*")
 
     def _save(self):
         name = self.vars["name"].get().strip()
@@ -393,7 +602,6 @@ class RouteEditor(tk.Toplevel):
             return
         self.result = {k: v.get().strip() for k, v in self.vars.items()}
         self.destroy()
-
 
 class ModelEditor(tk.Toplevel):
     def __init__(self, parent, row=None, title="编辑模型"):
@@ -566,23 +774,58 @@ class ModelTestDialog(tk.Toplevel):
         self.parent = parent
         self.route = route
         self.data, self.table_key, self.rows = get_model_rows_for_route(route)
-        self.title(f"模型测试 - {route.get('name', '')}")
+        self.title(f"模型测试 - {route.get('name', '')}（独立表）")
         self.geometry("1120x680")
         self.minsize(980, 560)
         self.filtered_indexes = []
         self._testing = False
-        self.sort_column = "model"
-        self.sort_reverse = False
+        self._closed = False
+        self.table_meta = self.data.setdefault("meta", {}).setdefault(self.table_key, {})
+        filters = self.table_meta.setdefault("filters", {})
+        self.sort_column = self.table_meta.get("sort_column", "model")
+        self.sort_reverse = bool(self.table_meta.get("sort_reverse", False))
         self.column_headings = {}
 
-        self.input_max_var = tk.StringVar(value="4")
-        self.output_max_var = tk.StringVar(value="12")
-        self.cache_max_var = tk.StringVar(value="")
-        self.keyword_var = tk.StringVar(value="")
-        self.status_var = tk.StringVar(value="默认筛选：输入 <= 4，输出 <= 12，缓存不限")
+        self.input_max_var = tk.StringVar(value=str(filters.get("input_max", "4")))
+        self.output_max_var = tk.StringVar(value=str(filters.get("output_max", "12")))
+        self.cache_max_var = tk.StringVar(value=str(filters.get("cache_max", "")))
+        self.keyword_var = tk.StringVar(value=str(filters.get("keyword", "")))
+        self.status_var = tk.StringVar(value="已加载当前中转站自己的筛选与模型表")
 
         self._build_ui()
         self._refresh_table()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        self._closed = True
+        self.destroy()
+
+    def _ui_call(self, func, *args):
+        if self._closed:
+            return
+        try:
+            self.after(0, lambda: self._run_ui_call(func, *args))
+        except tk.TclError:
+            self._closed = True
+
+    def _run_ui_call(self, func, *args):
+        if self._closed or not self.winfo_exists():
+            return
+        try:
+            func(*args)
+        except tk.TclError:
+            self._closed = True
+
+    def _save_view_state(self):
+        self.table_meta["filters"] = {
+            "keyword": self.keyword_var.get().strip(),
+            "input_max": self.input_max_var.get().strip(),
+            "output_max": self.output_max_var.get().strip(),
+            "cache_max": self.cache_max_var.get().strip(),
+        }
+        self.table_meta["sort_column"] = self.sort_column
+        self.table_meta["sort_reverse"] = self.sort_reverse
+        save_model_tables(self.data)
 
     def _build_ui(self):
         top = tk.LabelFrame(self, text="筛选与操作", padx=8, pady=6)
@@ -597,7 +840,7 @@ class ModelTestDialog(tk.Toplevel):
             tk.Label(top, text=label).pack(side="left", padx=(4, 2))
             tk.Entry(top, textvariable=var, width=width).pack(side="left", padx=(0, 8))
 
-        tk.Button(top, text="筛选", command=self._refresh_table).pack(side="left", padx=2)
+        tk.Button(top, text="筛选", command=self._apply_filter).pack(side="left", padx=2)
         tk.Button(top, text="清空筛选", command=self._clear_filter).pack(side="left", padx=2)
         tk.Button(top, text="测试筛选结果", command=self._test_filtered, bg="#4CAF50", fg="white").pack(side="left", padx=(12, 2))
         tk.Button(top, text="测试选中", command=self._test_selected).pack(side="left", padx=2)
@@ -605,7 +848,7 @@ class ModelTestDialog(tk.Toplevel):
 
         mid = tk.Frame(self)
         mid.pack(fill="both", expand=True, padx=10, pady=6)
-        columns = ("model", "input", "output", "cache_read", "cache_write", "channel", "tags", "status", "latency")
+        columns = ("model", "input", "output", "cache_read", "cache_write", "channel", "tags", "status", "latency", "error")
         self.tree = ttk.Treeview(mid, columns=columns, show="headings", selectmode="extended")
         headings = {
             "model": "模型",
@@ -617,9 +860,10 @@ class ModelTestDialog(tk.Toplevel):
             "tags": "标签",
             "status": "状态",
             "latency": "耗时ms",
+            "error": "错误信息",
         }
         self.column_headings = headings
-        widths = {"model": 230, "input": 70, "output": 80, "cache_read": 70, "cache_write": 70, "channel": 110, "tags": 190, "status": 70, "latency": 70}
+        widths = {"model": 230, "input": 70, "output": 80, "cache_read": 70, "cache_write": 70, "channel": 110, "tags": 170, "status": 70, "latency": 70, "error": 260}
         for col in columns:
             self.tree.heading(col, text=headings[col], command=lambda c=col: self._sort_by(c))
             self.tree.column(col, width=widths[col], anchor="w")
@@ -643,6 +887,7 @@ class ModelTestDialog(tk.Toplevel):
             ("AI导入表格", self._ai_import),
             ("AI导入Prompt", self._edit_prompt),
             ("保存表格", self._save),
+            ("复制当前表到其它路线", self._copy_to_route),
         ]:
             tk.Button(bottom, text=text, command=cmd).pack(side="left", padx=3)
         tk.Button(bottom, text="用内置 Claude 表重置当前站点", command=self._reset_default).pack(side="left", padx=(18, 3))
@@ -675,6 +920,8 @@ class ModelTestDialog(tk.Toplevel):
         return True
 
     def _refresh_table(self):
+        if self._closed or not self.winfo_exists() or not self.tree.winfo_exists():
+            return
         self.tree.delete(*self.tree.get_children())
         matched_indexes = []
         for idx, row in enumerate(self.rows):
@@ -698,6 +945,7 @@ class ModelTestDialog(tk.Toplevel):
                 ", ".join(row.get("tags", [])),
                 row.get("last_status", ""),
                 row.get("last_latency_ms", ""),
+                error_display(row.get("last_error", "")),
             ))
         self.status_var.set(f"显示 {len(self.filtered_indexes)} / 共 {len(self.rows)} 个模型")
 
@@ -717,6 +965,8 @@ class ModelTestDialog(tk.Toplevel):
             return ", ".join(row.get("tags", [])).lower()
         if self.sort_column == "status":
             return str(row.get("last_status", "")).lower()
+        if self.sort_column == "error":
+            return str(row.get("last_error", "")).lower()
         if self.sort_column == "channel":
             return str(row.get("channel", "")).lower()
         return str(row.get("model", "")).lower()
@@ -730,6 +980,7 @@ class ModelTestDialog(tk.Toplevel):
         else:
             self.sort_column = column
             self.sort_reverse = False
+        self._save_view_state()
         self._refresh_table()
 
     def _refresh_headings(self):
@@ -739,11 +990,16 @@ class ModelTestDialog(tk.Toplevel):
                 arrow = " ↓" if self.sort_reverse else " ↑"
             self.tree.heading(col, text=text + arrow, command=lambda c=col: self._sort_by(c))
 
+    def _apply_filter(self):
+        self._save_view_state()
+        self._refresh_table()
+
     def _clear_filter(self):
         self.keyword_var.set("")
         self.input_max_var.set("")
         self.output_max_var.set("")
         self.cache_max_var.set("")
+        self._save_view_state()
         self._refresh_table()
 
     def _selected_indexes(self):
@@ -831,7 +1087,48 @@ class ModelTestDialog(tk.Toplevel):
         self._save()
         self._refresh_table()
 
+    def _copy_to_route(self):
+        targets = [(i, r) for i, r in enumerate(self.parent.routes) if r is not self.route]
+        if not targets:
+            messagebox.showwarning("提示", "没有其它路线可复制", parent=self)
+            return
+        chooser = tk.Toplevel(self)
+        chooser.title("复制当前模型表到其它路线")
+        chooser.geometry("420x360")
+        tk.Label(chooser, text="选择目标路线：", anchor="w").pack(fill="x", padx=10, pady=(10, 4))
+        listbox = tk.Listbox(chooser, selectmode="extended")
+        listbox.pack(fill="both", expand=True, padx=10, pady=4)
+        for _, route in targets:
+            listbox.insert("end", route.get("name", "未命名"))
+
+        def do_copy():
+            selections = listbox.curselection()
+            if not selections:
+                messagebox.showwarning("提示", "请先选择目标路线", parent=chooser)
+                return
+            self._save()
+            tables = self.data.setdefault("tables", {})
+            meta = self.data.setdefault("meta", {})
+            copied = 0
+            for selection in selections:
+                _, target_route = targets[selection]
+                target_key = route_table_key(target_route)
+                tables[target_key] = [normalize_model_row(row.copy()) for row in self.rows]
+                meta[target_key] = json.loads(json.dumps(self.table_meta, ensure_ascii=False))
+                copied += 1
+            save_routes(self.parent.routes)
+            save_model_tables(self.data)
+            chooser.destroy()
+            messagebox.showinfo("完成", f"已复制到 {copied} 条路线；它们之后会各自独立保存", parent=self)
+
+        btns = tk.Frame(chooser)
+        btns.pack(fill="x", padx=10, pady=10)
+        tk.Button(btns, text="复制", command=do_copy, width=12).pack(side="right", padx=4)
+        tk.Button(btns, text="取消", command=chooser.destroy, width=12).pack(side="right", padx=4)
+        chooser.grab_set()
+
     def _save(self):
+        self._save_view_state()
         self.data.setdefault("tables", {})[self.table_key] = self.rows
         save_model_tables(self.data)
 
@@ -861,19 +1158,22 @@ class ModelTestDialog(tk.Toplevel):
     def _run_tests(self, indexes):
         total = len(indexes)
         for offset, idx in enumerate(indexes, 1):
+            if self._closed:
+                break
             row = normalize_model_row(self.rows[idx])
             model = row.get("model", "")
-            self.after(0, lambda m=model, o=offset, t=total: self.status_var.set(f"测试中 {o}/{t}: {m}"))
+            self._ui_call(self.status_var.set, f"测试中 {offset}/{total}: {model}")
             ok, latency, info = test_model(self.route, model)
             row["last_status"] = "联通" if ok else "失败"
             row["last_latency_ms"] = latency
             row["last_error"] = "" if ok else info
             row["last_tested_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             self.rows[idx] = row
-            self.after(0, self._refresh_table)
-        self._save()
+            self._ui_call(self._refresh_table)
+        self.data.setdefault("tables", {})[self.table_key] = self.rows
+        save_model_tables(self.data)
         self._testing = False
-        self.after(0, lambda: self.status_var.set("测试完成"))
+        self._ui_call(self.status_var.set, "测试完成")
 
     def _apply_selected_model(self):
         indexes = self._selected_indexes()
@@ -900,6 +1200,7 @@ class App(tk.Tk):
         self.minsize(680, 420)
 
         self.routes = load_routes()
+        self.sync_clawgod_var = tk.BooleanVar(value=False)
         self._build_ui()
         self._refresh_list(0)
         self._refresh_global_status()
@@ -951,7 +1252,7 @@ class App(tk.Tk):
         list_btns = tk.Frame(left)
         list_btns.pack(fill="x", pady=(4, 0))
         for text, cmd in [("➕", self._add), ("✏️", self._edit), ("🗑", self._delete),
-                          ("⬆", self._move_up), ("⬇", self._move_down)]:
+                          ("⬆", self._move_up), ("⬇", self._move_down), ("⧉", self._duplicate)]:
             tk.Button(list_btns, text=text, width=4, command=cmd).pack(side="left", padx=2)
 
         # 右侧
@@ -965,7 +1266,8 @@ class App(tk.Tk):
 
         self.detail_vars = {}
         for label, key in [("名称", "name"), ("BASE_URL", "base_url"),
-                            ("AUTH_TOKEN", "api_key"), ("model", "model"), ("备注", "note")]:
+                            ("密钥", "api_key"), ("认证变量", "auth_var"),
+                            ("model", "model"), ("备注", "note")]:
             row = tk.Frame(detail)
             row.pack(fill="x", pady=2)
             tk.Label(row, text=label + ":", width=10, anchor="w", fg="#666").pack(side="left")
@@ -997,6 +1299,14 @@ class App(tk.Tk):
             command=self._open_model_tests,
             bg="#EF6C00", fg="white", font=("", 10, "bold"),
             relief="flat", padx=8, pady=5, cursor="hand2",
+        ).pack(fill="x", pady=(0, 6))
+
+        tk.Checkbutton(
+            btn_area,
+            text="同步 ClawGod provider.json（默认不改）",
+            variable=self.sync_clawgod_var,
+            anchor="w",
+            justify="left",
         ).pack(fill="x")
 
         self.status_var = tk.StringVar(value="选择路线后操作")
@@ -1025,8 +1335,22 @@ class App(tk.Tk):
         r = self.routes[idx]
         apply_global(r)
         sync_settings(r)
+        sync_oauth_identity(r)
+        if self.sync_clawgod_var.get():
+            sync_clawgod_warlord(r)
         self._refresh_global_status()
-        self.status_var.set(f"已设为全局：{r['name']}（注册表 ANTHROPIC_MODEL + settings.json 已更新）")
+        extra = "，ClawGod 已同步" if self.sync_clawgod_var.get() else ""
+        ps_cmd = build_powershell_env_command(r)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(ps_cmd)
+            clip_note = "；当前 WT/Powershell 刷新命令已复制"
+        except tk.TclError:
+            clip_note = ""
+        self.status_var.set(
+            f"已设为全局：{r['name']}（注册表 + settings.json 已更新{extra}{clip_note}；"
+            "粘贴到当前 WT/Powershell 后 Ctrl+C + resume 生效）"
+        )
 
     def _clear_global(self):
         clear_global()
@@ -1071,12 +1395,17 @@ class App(tk.Tk):
         key = r.get("api_key", "")
         masked = (key[:4] + "****" + key[-4:] if len(key) > 8 else "****") if key else "(系统默认，不覆盖)"
         self.detail_vars["api_key"].set(masked)
+        self.detail_vars["auth_var"].set(route_auth_var(r))
         self.detail_vars["model"].set(r.get("model", "") or "(留空，不覆盖)")
         self.detail_vars["note"].set(r.get("note", ""))
+        oauth = r.get("oauth_json", "")
+        if oauth:
+            self.detail_vars["api_key"].set("👑 [已绑定纯血 Pro OAuth 凭证]")
 
     def _add(self):
         editor = RouteEditor(self, title="添加路线")
         if editor.result:
+            ensure_route_table_id(editor.result)
             self.routes.append(editor.result)
             save_routes(self.routes)
             self._refresh_list(len(self.routes) - 1)
@@ -1087,6 +1416,7 @@ class App(tk.Tk):
             return
         editor = RouteEditor(self, route=self.routes[idx], title="编辑路线")
         if editor.result:
+            editor.result["table_id"] = self.routes[idx].get("table_id") or ensure_route_table_id(self.routes[idx])
             self.routes[idx] = editor.result
             save_routes(self.routes)
             self._refresh_list(idx)
@@ -1117,6 +1447,18 @@ class App(tk.Tk):
         save_routes(self.routes)
         self._refresh_list(idx + 1)
 
+    def _duplicate(self):
+        idx = self._selected_idx()
+        if idx is None:
+            return
+        import copy
+        new_route = copy.deepcopy(self.routes[idx])
+        new_route["name"] = new_route.get("name", "") + " (副本)"
+        new_route["table_id"] = f"route-{uuid.uuid4().hex[:12]}"
+        self.routes.insert(idx + 1, new_route)
+        save_routes(self.routes)
+        self._refresh_list(idx + 1)
+
     # ── 仅此次启动 ────────────────────────────────────────────────────────────
 
     def _launch(self):
@@ -1127,15 +1469,27 @@ class App(tk.Tk):
         r = self.routes[idx]
         # model 既写入 settings.json，也通过子进程环境变量 ANTHROPIC_MODEL 传递
         sync_settings(r)
+        sync_oauth_identity(r)
+        if self.sync_clawgod_var.get():
+            sync_clawgod_warlord(r)
         self._refresh_global_status()
         env = os.environ.copy()
-        if r.get("base_url"):
+        if r.get("oauth_json"):
+            env.pop("ANTHROPIC_BASE_URL", None)  # 独立启动时，Pro号同样强行踢掉BaseURL
+        elif r.get("base_url"):
             env["ANTHROPIC_BASE_URL"] = r["base_url"]
         else:
             env.pop("ANTHROPIC_BASE_URL", None)
-        if r.get("api_key"):
-            env["ANTHROPIC_API_KEY"]    = r["api_key"]
-            env["ANTHROPIC_AUTH_TOKEN"] = r["api_key"]
+
+        if r.get("oauth_json"):
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        elif r.get("api_key"):
+            apply_api_auth(env, r["api_key"], route_auth_var(r))
+        else:
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+
         if r.get("model"):
             env["ANTHROPIC_MODEL"] = r["model"]
         else:
@@ -1146,7 +1500,8 @@ class App(tk.Tk):
                 env=env,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
             )
-            self.status_var.set(f"已启动（settings.json 已同步）：{r['name']}")
+            extra = "，ClawGod 已同步" if self.sync_clawgod_var.get() else ""
+            self.status_var.set(f"已启动（settings.json 已同步{extra}）：{r['name']}")
         except FileNotFoundError:
             messagebox.showerror("错误", "找不到 claude 命令\n请确认 Claude Code 已安装并在 PATH 中")
 
