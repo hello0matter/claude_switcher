@@ -11,6 +11,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from codex_panel import CodexPanel
+
 CONFIG_FILE   = os.path.expanduser("~/.cc_routes.json")
 SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
 OAUTH_FILE    = os.path.expanduser("~/.claude/claude.json")
@@ -1195,9 +1197,9 @@ class ModelTestDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Claude Route Switcher")
-        self.geometry("820x500")
-        self.minsize(680, 420)
+        self.title("Claude & Codex Route Switcher")
+        self.geometry("980x620")
+        self.minsize(820, 520)
 
         self.routes = load_routes()
         self.sync_clawgod_var = tk.BooleanVar(value=False)
@@ -1206,8 +1208,15 @@ class App(tk.Tk):
         self._refresh_global_status()
 
     def _build_ui(self):
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=6, pady=6)
+        self.claude_tab = tk.Frame(self.notebook)
+        self.codex_tab = tk.Frame(self.notebook)
+        self.notebook.add(self.claude_tab, text="Claude 路线")
+        self.notebook.add(self.codex_tab, text="Codex 专区")
+
         # ── 顶部全局状态栏 ──
-        top = tk.Frame(self, bg="#f0f0f0", pady=4)
+        top = tk.Frame(self.claude_tab, bg="#f0f0f0", pady=4)
         top.pack(fill="x", padx=10, pady=(8, 0))
 
         tk.Label(top, text="全局路线：", bg="#f0f0f0", font=("", 9)).pack(side="left")
@@ -1225,7 +1234,7 @@ class App(tk.Tk):
         ).pack(side="right", padx=4)
 
         # ── 主体：左列表 + 右详情 ──
-        body = tk.Frame(self)
+        body = tk.Frame(self.claude_tab)
         body.pack(fill="both", expand=True, padx=10, pady=8)
 
         # 左侧
@@ -1313,6 +1322,9 @@ class App(tk.Tk):
         tk.Label(right, textvariable=self.status_var, fg="#888", font=("", 8)).pack(
             anchor="w", pady=(4, 0)
         )
+
+        self.codex_panel = CodexPanel(self.codex_tab)
+        self.codex_panel.pack(fill="both", expand=True)
 
     # ── 全局状态 ──────────────────────────────────────────────────────────────
 
