@@ -566,7 +566,7 @@ def sync_codex_history_provider(provider_id):
     return result.rollout_updates, result.manifest
 
 
-def _codex_console_command(binary, resume_all=False):
+def _codex_console_command(binary, resume_all=False, session_id=None):
     if binary == "codex":
         executable = os.environ.get("CODEX_COMMAND", "codex")
     elif binary == "codexx":
@@ -575,7 +575,12 @@ def _codex_console_command(binary, resume_all=False):
         executable = str(CODEXX_EXE)
     else:
         raise ValueError(f"未知 Codex 二进制：{binary}")
-    arguments = ["resume", "--all"] if resume_all else ["--yolo"]
+    if session_id:
+        arguments = ["resume", session_id]
+    elif resume_all:
+        arguments = ["resume", "--all"]
+    else:
+        arguments = ["--yolo"]
     return ["cmd.exe", "/k", executable, *arguments]
 
 
@@ -797,7 +802,7 @@ class CodexPanel(tk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
         self.routes = load_codex_routes()
-        self.sync_history_var = tk.BooleanVar(value=False)
+        self.session_id_var = tk.StringVar()
         self._build_ui()
         self.refresh_list(0)
         self.refresh_status()
@@ -848,16 +853,26 @@ class CodexPanel(tk.Frame):
         launch_row.pack(fill="x", pady=(0, 4))
         tk.Button(launch_row, text="启动 Codex", command=self.launch, bg="#238636", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(side="left", fill="x", expand=True, padx=(0, 2))
         tk.Button(launch_row, text="启动 Codexx", command=self.launch_codexx, bg="#1f6f9f", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(side="left", fill="x", expand=True, padx=(2, 0))
-        resume_row = tk.Frame(action)
-        resume_row.pack(fill="x", pady=(0, 4))
-        tk.Button(resume_row, text="Codex resume --all", command=self.resume_codex, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(0, 2))
-        tk.Button(resume_row, text="Codexx resume --all", command=self.resume_codexx, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        browse_row = tk.Frame(action)
+        browse_row.pack(fill="x", pady=(0, 4))
+        tk.Button(browse_row, text="查看当前 Codex 会话", command=self.resume_codex, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        tk.Button(browse_row, text="查看当前 Codexx 会话", command=self.resume_codexx, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        session_row = tk.Frame(action)
+        session_row.pack(fill="x", pady=(2, 4))
+        tk.Label(session_row, text="Session ID：", width=11, anchor="w").pack(side="left")
+        tk.Entry(session_row, textvariable=self.session_id_var).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Button(session_row, text="粘贴", command=self.paste_session_id, width=6).pack(side="left")
+
+        restore_row = tk.Frame(action)
+        restore_row.pack(fill="x", pady=(0, 4))
+        tk.Button(restore_row, text="按 ID 恢复 Codex", command=self.resume_codex_id, bg="#238636", fg="white", relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        tk.Button(restore_row, text="按 ID 恢复 Codexx", command=self.resume_codexx_id, bg="#1f6f9f", fg="white", relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(2, 0))
+
         tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
-        tk.Button(action, text="一键同步全部 Session 可见性", command=self.sync_history, bg="#5c3d99", fg="white", relief="flat", pady=4).pack(fill="x", pady=(0, 4))
-        tk.Checkbutton(action, text="切换/启动时自动同步 Session 可见性（可选）", variable=self.sync_history_var, anchor="w").pack(fill="x")
         tk.Label(
             action,
-            text="说明：快速同步只更新 resume 索引，不再遍历约 5.9GB 的 Session 文件。",
+            text="流程：先查看当前会话，Ctrl+E 展开复制 ID；再选路线，按 ID 直接恢复。不做 Session 可见性同步。",
             fg="#666",
             font=("", 8),
             justify="left",
@@ -957,16 +972,9 @@ class CodexPanel(tk.Frame):
 
     def _apply(self, route):
         backup = _write_codex_config(route)
-        history = None
-        if self.sync_history_var.get():
-            history = sync_codex_session_visibility(route["provider_id"])
         self.refresh_status()
         backup_note = "，已备份 config.toml" if backup else ""
-        history_note = ""
-        if history:
-            history_note = f"，索引 {history.db_matching}/{history.db_total}"
-        self.status_var.set(f"已应用：{route['name']}{backup_note}{history_note}")
-        return history
+        self.status_var.set(f"已应用：{route['name']}{backup_note}")
 
     def apply_global(self):
         route = self._selected_route()
@@ -978,20 +986,6 @@ class CodexPanel(tk.Frame):
         except Exception as exc:
             messagebox.showerror("Codex 配置失败", str(exc), parent=self)
 
-    def sync_history(self):
-        route = self._selected_route()
-        if route is None:
-            return
-        try:
-            result = sync_codex_session_visibility(route["provider_id"])
-            note = (
-                f"快速同步完成：索引 {result.db_matching}/{result.db_total}"
-                f"（改 {result.db_updates}）；resume 普通会话 {result.picker_visible}"
-            )
-            self.status_var.set(note)
-        except Exception as exc:
-            messagebox.showerror("历史同步失败", str(exc), parent=self)
-
     def launch(self):
         self._launch_binary("codex")
 
@@ -999,23 +993,51 @@ class CodexPanel(tk.Frame):
         self._launch_binary("codexx")
 
     def resume_codex(self):
-        self._launch_binary("codex", resume_all=True)
+        self._launch_binary("codex", resume_all=True, apply_route=False)
 
     def resume_codexx(self):
-        self._launch_binary("codexx", resume_all=True)
+        self._launch_binary("codexx", resume_all=True, apply_route=False)
 
-    def _launch_binary(self, binary, resume_all=False):
-        route = self._selected_route()
-        if route is None:
+    def paste_session_id(self):
+        try:
+            value = self.clipboard_get().strip()
+        except tk.TclError:
+            value = ""
+        if value:
+            self.session_id_var.set(value)
+
+    def resume_codex_id(self):
+        self._resume_by_id("codex")
+
+    def resume_codexx_id(self):
+        self._resume_by_id("codexx")
+
+    def _resume_by_id(self, binary):
+        session_id = self.session_id_var.get().strip()
+        if not session_id:
+            messagebox.showwarning("提示", "请先粘贴 Session ID", parent=self)
+            return
+        self._launch_binary(binary, session_id=session_id)
+
+    def _launch_binary(self, binary, resume_all=False, session_id=None, apply_route=True):
+        route = self._selected_route() if apply_route else None
+        if apply_route and route is None:
             messagebox.showwarning("提示", "请先选择一条 Codex 路线", parent=self)
             return
         display_name = "Codexx" if binary == "codexx" else "Codex"
         try:
-            self._apply(route)
-            command = _codex_console_command(binary, resume_all)
+            if route is not None:
+                self._apply(route)
+            command = _codex_console_command(binary, resume_all, session_id)
             subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_CONSOLE)
-            action = "resume --all" if resume_all else "启动"
-            self.status_var.set(f"已{action} {display_name}：{route['name']}")
+            if session_id:
+                action = f"按 ID 恢复 {display_name}"
+            elif resume_all:
+                action = f"已打开当前 {display_name} 会话列表"
+            else:
+                action = f"已启动 {display_name}"
+            route_note = f"：{route['name']}" if route else ""
+            self.status_var.set(action + route_note)
         except FileNotFoundError as exc:
             detail = str(exc) if str(exc) else f"找不到 {display_name} 二进制文件"
             messagebox.showerror("错误", detail, parent=self)

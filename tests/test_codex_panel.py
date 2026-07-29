@@ -182,6 +182,12 @@ class CodexPanelCoreTests(unittest.TestCase):
                 codex_panel._codex_console_command("codex"),
                 ["cmd.exe", "/k", "codex", "--yolo"],
             )
+            self.assertEqual(
+                codex_panel._codex_console_command(
+                    "codex", session_id="019f-test-session"
+                ),
+                ["cmd.exe", "/k", "codex", "resume", "019f-test-session"],
+            )
 
     def test_fast_visibility_sync_does_not_scan_rollout_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -213,12 +219,10 @@ class CodexPanelCoreTests(unittest.TestCase):
             self.assertEqual(result.db_matching, 1)
             self.assertEqual(result.picker_visible, 1)
 
-    def test_applying_route_does_not_sync_sessions_when_option_is_off(self):
+    def test_applying_route_never_syncs_session_visibility(self):
         panel = object.__new__(codex_panel.CodexPanel)
         panel.refresh_status = mock.Mock()
         panel.status_var = mock.Mock()
-        panel.sync_history_var = mock.Mock()
-        panel.sync_history_var.get.return_value = False
         route = codex_panel._normalise_route({
             "name": "Fast route",
             "provider_id": "fast",
@@ -232,35 +236,12 @@ class CodexPanelCoreTests(unittest.TestCase):
         panel.refresh_status.assert_called_once_with()
         panel.status_var.set.assert_called_once_with("已应用：Fast route")
 
-    def test_applying_route_syncs_sessions_when_option_is_on(self):
+    def test_resume_picker_does_not_apply_selected_route(self):
         panel = object.__new__(codex_panel.CodexPanel)
-        panel.refresh_status = mock.Mock()
-        panel.status_var = mock.Mock()
-        panel.sync_history_var = mock.Mock()
-        panel.sync_history_var.get.return_value = True
-        route = codex_panel._normalise_route({
-            "name": "Compatible route",
-            "provider_id": "compatible",
-            "wire_api": "responses",
-        })
-        result = codex_panel.CodexHistorySyncResult(
-            rollout_updates=2,
-            rollout_matching=10,
-            rollout_total=10,
-            manifest=None,
-            db_updates=3,
-            db_matching=9,
-            db_total=9,
-            picker_visible=8,
-            db_backup=None,
-        )
-        with mock.patch.object(codex_panel, "_write_codex_config", return_value=None), mock.patch.object(
-            codex_panel, "sync_codex_session_visibility", return_value=result
-        ) as sync_visibility:
-            panel._apply(route)
-        sync_visibility.assert_called_once_with("compatible")
-        panel.status_var.set.assert_called_once_with(
-            "已应用：Compatible route，索引 9/9"
+        panel._launch_binary = mock.Mock()
+        panel.resume_codex()
+        panel._launch_binary.assert_called_once_with(
+            "codex", resume_all=True, apply_route=False
         )
 
     def test_openai_endpoint_builder(self):
