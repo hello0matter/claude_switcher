@@ -183,10 +183,12 @@ class CodexPanelCoreTests(unittest.TestCase):
                 ["cmd.exe", "/k", "codex", "--yolo"],
             )
 
-    def test_applying_route_does_not_scan_or_sync_sessions(self):
+    def test_applying_route_does_not_sync_sessions_when_option_is_off(self):
         panel = object.__new__(codex_panel.CodexPanel)
         panel.refresh_status = mock.Mock()
         panel.status_var = mock.Mock()
+        panel.sync_history_var = mock.Mock()
+        panel.sync_history_var.get.return_value = False
         route = codex_panel._normalise_route({
             "name": "Fast route",
             "provider_id": "fast",
@@ -199,6 +201,37 @@ class CodexPanelCoreTests(unittest.TestCase):
         sync_visibility.assert_not_called()
         panel.refresh_status.assert_called_once_with()
         panel.status_var.set.assert_called_once_with("已应用：Fast route")
+
+    def test_applying_route_syncs_sessions_when_option_is_on(self):
+        panel = object.__new__(codex_panel.CodexPanel)
+        panel.refresh_status = mock.Mock()
+        panel.status_var = mock.Mock()
+        panel.sync_history_var = mock.Mock()
+        panel.sync_history_var.get.return_value = True
+        route = codex_panel._normalise_route({
+            "name": "Compatible route",
+            "provider_id": "compatible",
+            "wire_api": "responses",
+        })
+        result = codex_panel.CodexHistorySyncResult(
+            rollout_updates=2,
+            rollout_matching=10,
+            rollout_total=10,
+            manifest=None,
+            db_updates=3,
+            db_matching=9,
+            db_total=9,
+            picker_visible=8,
+            db_backup=None,
+        )
+        with mock.patch.object(codex_panel, "_write_codex_config", return_value=None), mock.patch.object(
+            codex_panel, "sync_codex_session_visibility", return_value=result
+        ) as sync_visibility:
+            panel._apply(route)
+        sync_visibility.assert_called_once_with("compatible")
+        panel.status_var.set.assert_called_once_with(
+            "已应用：Compatible route，Session 10/10，索引 9/9"
+        )
 
     def test_openai_endpoint_builder(self):
         self.assertEqual(

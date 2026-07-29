@@ -735,6 +735,7 @@ class CodexPanel(tk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
         self.routes = load_codex_routes()
+        self.sync_history_var = tk.BooleanVar(value=False)
         self._build_ui()
         self.refresh_list(0)
         self.refresh_status()
@@ -791,9 +792,10 @@ class CodexPanel(tk.Frame):
         tk.Button(resume_row, text="Codexx resume --all", command=self.resume_codexx, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(2, 0))
         tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
         tk.Button(action, text="一键同步全部 Session 可见性", command=self.sync_history, bg="#5c3d99", fg="white", relief="flat", pady=4).pack(fill="x", pady=(0, 4))
+        tk.Checkbutton(action, text="切换/启动时自动同步 Session 可见性（可选，较慢）", variable=self.sync_history_var, anchor="w").pack(fill="x")
         tk.Label(
             action,
-            text="说明：可见性同步是独立的手动操作；路线切换和启动不会扫描 Session。",
+            text="说明：默认不自动扫描 Session，切换更快；需要时可勾选自动同步。",
             fg="#666",
             font=("", 8),
             justify="left",
@@ -893,9 +895,19 @@ class CodexPanel(tk.Frame):
 
     def _apply(self, route):
         backup = _write_codex_config(route)
+        history = None
+        if self.sync_history_var.get():
+            history = sync_codex_session_visibility(route["provider_id"])
         self.refresh_status()
         backup_note = "，已备份 config.toml" if backup else ""
-        self.status_var.set(f"已应用：{route['name']}{backup_note}")
+        history_note = ""
+        if history:
+            history_note = (
+                f"，Session {history.rollout_matching}/{history.rollout_total}"
+                f"，索引 {history.db_matching}/{history.db_total}"
+            )
+        self.status_var.set(f"已应用：{route['name']}{backup_note}{history_note}")
+        return history
 
     def apply_global(self):
         route = self._selected_route()
