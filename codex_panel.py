@@ -16,6 +16,7 @@ import tomllib
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import tkinter as tk
@@ -33,7 +34,29 @@ CODEX_ROUTES_FILE = Path.home() / ".codex_routes.json"
 CODEX_SESSION_BACKUP_DIR = CODEX_HOME / "session-meta-backups"
 CODEX_DB_BACKUP_DIR = CODEX_HOME / "db-backups"
 CODEX_DB_FILE = CODEX_HOME / "state_5.sqlite"
+CODEXX_EXE = Path(
+    os.environ.get(
+        "CODEXX_EXE",
+        CODEX_HOME / ".sandbox-bin" / "codexhistory" / "codexx.exe",
+    )
+)
 SESSION_META_PROVIDER = re.compile(rb'("model_provider"\s*:\s*)("(?:[^"\\]|\\.)*")([ \t]*)')
+VISIBILITY_SETTINGS_TABLE = "codex_resume_visibility_settings"
+VISIBILITY_INSERT_TRIGGER = "codex_resume_visibility_after_insert"
+VISIBILITY_UPDATE_TRIGGER = "codex_resume_visibility_after_update"
+
+
+@dataclass(frozen=True)
+class CodexHistorySyncResult:
+    rollout_updates: int
+    rollout_matching: int
+    rollout_total: int
+    manifest: Path | None
+    db_updates: int
+    db_matching: int
+    db_total: int
+    picker_visible: int
+    db_backup: Path | None
 
 
 def _now_stamp():
@@ -262,12 +285,192 @@ def _apply_rollout_provider_plan(plan):
         return False
 
 
-def sync_codex_history_provider(provider_id):
+def _table_exists(db, name):
+    return db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone() is not None
+
+
+def _extended_windows_path(path):
+    if path.startswith("\\\\?\\") or path.startswith("\\\\"):
+        return path
+    if re.match(r"^[A-Za-z]:\\", path):
+        return "\\\\?\\" + path
+    return path
+
+
+def _visibility_trigger_sql(trigger_name, operation, include_cwd):
+    event = "INSERT" if operation == "insert" else "UPDATE OF model_provider"
+    if operation == "update" and include_cwd:
+        event += ", cwd"
+    provider_expression = (
+        f"(SELECT model_provider FROM {VISIBILITY_SETTINGS_TABLE} WHERE id = 1)"
+    )
+    conditions = [f"NEW.model_provider <> {provider_expression}"]
+    assignments = [f"model_provider = {provider_expression}"]
+    if include_cwd:
+        plain_drive_path = "length(NEW.cwd) >= 3 AND substr(NEW.cwd, 2, 2) = ':\\'"
+        conditions.append(f"({plain_drive_path})")
+        assignments.append(
+            "cwd = CASE "
+            f"WHEN {plain_drive_path} THEN '\\\\?\\' || NEW.cwd "
+            "ELSE NEW.cwd END"
+        )
+    return f"""
+        CREATE TRIGGER {trigger_name}
+        AFTER {event} ON threads
+        WHEN {' OR '.join(conditions)}
+        BEGIN
+            UPDATE threads
+            SET {', '.join(assignments)}
+            WHERE id = NEW.id;
+        END
+    """
+
+
+def _normalise_sql(sql):
+    return re.sub(r"\s+", " ", sql or "").strip()
+
+
+def _sync_codex_history_db(provider_id):
+    empty = {
+        "updates": 0,
+        "matching": 0,
+        "total": 0,
+        "picker_visible": 0,
+        "backup": None,
+    }
+    if not CODEX_DB_FILE.exists():
+        return empty
+
+    db = None
+    try:
+        db = sqlite3.connect(CODEX_DB_FILE, timeout=30)
+        if not _table_exists(db, "threads"):
+            return empty
+        columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
+        if not {"id", "model_provider"}.issubset(columns):
+            return empty
+
+        total = db.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+        mismatched = db.execute(
+            "SELECT COUNT(*) FROM threads WHERE model_provider <> ?",
+            (provider_id,),
+        ).fetchone()[0]
+        setting = None
+        if _table_exists(db, VISIBILITY_SETTINGS_TABLE):
+            row = db.execute(
+                f"SELECT model_provider FROM {VISIBILITY_SETTINGS_TABLE} WHERE id = 1"
+            ).fetchone()
+            setting = row[0] if row else None
+
+        include_cwd = "cwd" in columns
+        cwd_updates = []
+        if include_cwd:
+            cwd_updates = [
+                (normalised, thread_id)
+                for thread_id, cwd in db.execute("SELECT id, cwd FROM threads")
+                if cwd is not None and (normalised := _extended_windows_path(cwd)) != cwd
+            ]
+
+        expected_triggers = {
+            VISIBILITY_INSERT_TRIGGER: _visibility_trigger_sql(
+                VISIBILITY_INSERT_TRIGGER, "insert", include_cwd
+            ),
+            VISIBILITY_UPDATE_TRIGGER: _visibility_trigger_sql(
+                VISIBILITY_UPDATE_TRIGGER, "update", include_cwd
+            ),
+        }
+        trigger_rows = dict(db.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
+            (VISIBILITY_INSERT_TRIGGER, VISIBILITY_UPDATE_TRIGGER),
+        ))
+        triggers_current = all(
+            _normalise_sql(trigger_rows.get(name)) == _normalise_sql(sql)
+            for name, sql in expected_triggers.items()
+        )
+        needs_change = bool(
+            mismatched
+            or cwd_updates
+            or setting != provider_id
+            or not triggers_current
+        )
+        backup_path = None
+        updates = 0
+        if needs_change:
+            CODEX_DB_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            backup_path = CODEX_DB_BACKUP_DIR / f"state_5.sqlite.bak-codex-switcher-{_now_stamp()}"
+            backup_db = sqlite3.connect(backup_path)
+            try:
+                db.backup(backup_db)
+            finally:
+                backup_db.close()
+
+            with db:
+                db.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {VISIBILITY_SETTINGS_TABLE} (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        model_provider TEXT NOT NULL
+                    )
+                """)
+                # Update the setting before touching thread rows. Existing durable triggers
+                # read this value and would otherwise change every row back to the old route.
+                db.execute(f"""
+                    INSERT INTO {VISIBILITY_SETTINGS_TABLE} (id, model_provider)
+                    VALUES (1, ?)
+                    ON CONFLICT(id) DO UPDATE SET model_provider = excluded.model_provider
+                """, (provider_id,))
+                for trigger_name in expected_triggers:
+                    db.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+                for trigger_sql in expected_triggers.values():
+                    db.execute(trigger_sql)
+                updates = db.execute(
+                    "UPDATE threads SET model_provider = ? WHERE model_provider <> ?",
+                    (provider_id, provider_id),
+                ).rowcount
+                if cwd_updates:
+                    db.executemany("UPDATE threads SET cwd = ? WHERE id = ?", cwd_updates)
+
+        matching = db.execute(
+            "SELECT COUNT(*) FROM threads WHERE model_provider = ?",
+            (provider_id,),
+        ).fetchone()[0]
+        picker_visible = 0
+        if {"archived", "preview", "source"}.issubset(columns):
+            picker_visible = db.execute("""
+                SELECT COUNT(*) FROM threads
+                WHERE archived = 0
+                  AND preview <> ''
+                  AND source IN ('cli', 'vscode')
+                  AND model_provider = ?
+            """, (provider_id,)).fetchone()[0]
+        return {
+            "updates": updates,
+            "matching": matching,
+            "total": total,
+            "picker_visible": picker_visible,
+            "backup": backup_path,
+        }
+    except sqlite3.Error as exc:
+        raise RuntimeError("Codex 历史索引数据库同步失败") from exc
+    finally:
+        if db is not None:
+            db.close()
+
+
+def sync_codex_session_visibility(provider_id):
     plans = []
+    rollout_total = 0
+    already_matching = 0
     for path in _iter_rollouts():
         plan = _plan_rollout_provider(path, provider_id)
         if isinstance(plan, dict):
             plans.append(plan)
+            rollout_total += 1
+        elif plan is False:
+            rollout_total += 1
+            already_matching += 1
     manifest = None
     if plans:
         CODEX_SESSION_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -281,31 +484,37 @@ def sync_codex_history_provider(provider_id):
             stream.flush()
             os.fsync(stream.fileno())
     applied = sum(1 for plan in plans if _apply_rollout_provider_plan(plan))
-    if CODEX_DB_FILE.exists():
-        db = None
-        try:
-            db = sqlite3.connect(CODEX_DB_FILE, timeout=30)
-            if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'").fetchone():
-                CODEX_DB_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-                backup_path = CODEX_DB_BACKUP_DIR / f"state_5.sqlite.bak-codex-switcher-{_now_stamp()}"
-                backup_db = sqlite3.connect(backup_path)
-                try:
-                    db.backup(backup_db)
-                finally:
-                    backup_db.close()
-                with db:
-                    db.execute("UPDATE threads SET model_provider = ?", (provider_id,))
-                    if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='codex_resume_visibility_settings'").fetchone():
-                        db.execute(
-                            "UPDATE codex_resume_visibility_settings SET model_provider = ? WHERE id = 1",
-                            (provider_id,),
-                        )
-        except sqlite3.Error as exc:
-            raise RuntimeError("Codex 历史索引数据库同步失败") from exc
-        finally:
-            if db is not None:
-                db.close()
-    return applied, manifest
+    db_result = _sync_codex_history_db(provider_id)
+    return CodexHistorySyncResult(
+        rollout_updates=applied,
+        rollout_matching=already_matching + applied,
+        rollout_total=rollout_total,
+        manifest=manifest,
+        db_updates=db_result["updates"],
+        db_matching=db_result["matching"],
+        db_total=db_result["total"],
+        picker_visible=db_result["picker_visible"],
+        db_backup=db_result["backup"],
+    )
+
+
+def sync_codex_history_provider(provider_id):
+    """Backward-compatible wrapper for callers expecting the original tuple."""
+    result = sync_codex_session_visibility(provider_id)
+    return result.rollout_updates, result.manifest
+
+
+def _codex_console_command(binary, resume_all=False):
+    if binary == "codex":
+        executable = os.environ.get("CODEX_COMMAND", "codex")
+    elif binary == "codexx":
+        if not CODEXX_EXE.is_file():
+            raise FileNotFoundError(f"找不到 Codexx：{CODEXX_EXE}")
+        executable = str(CODEXX_EXE)
+    else:
+        raise ValueError(f"未知 Codex 二进制：{binary}")
+    arguments = ["resume", "--all"] if resume_all else ["--yolo"]
+    return ["cmd.exe", "/k", executable, *arguments]
 
 
 def _openai_url(base_url, endpoint):
@@ -526,7 +735,6 @@ class CodexPanel(tk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
         self.routes = load_codex_routes()
-        self.sync_history_var = tk.BooleanVar(value=True)
         self._build_ui()
         self.refresh_list(0)
         self.refresh_status()
@@ -573,10 +781,24 @@ class CodexPanel(tk.Frame):
         action = tk.Frame(right)
         action.pack(fill="x", pady=(10, 0))
         tk.Button(action, text="设为 Codex 全局", command=self.apply_global, bg="#13795b", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
-        tk.Button(action, text="启动 Codex", command=self.launch, bg="#238636", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
+        launch_row = tk.Frame(action)
+        launch_row.pack(fill="x", pady=(0, 4))
+        tk.Button(launch_row, text="启动 Codex", command=self.launch, bg="#238636", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        tk.Button(launch_row, text="启动 Codexx", command=self.launch_codexx, bg="#1f6f9f", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        resume_row = tk.Frame(action)
+        resume_row.pack(fill="x", pady=(0, 4))
+        tk.Button(resume_row, text="Codex resume --all", command=self.resume_codex, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        tk.Button(resume_row, text="Codexx resume --all", command=self.resume_codexx, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(2, 0))
         tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
-        tk.Button(action, text="同步历史会话 provider", command=self.sync_history, relief="flat", pady=4).pack(fill="x", pady=(0, 4))
-        tk.Checkbutton(action, text="应用路线时同步历史可见性", variable=self.sync_history_var, anchor="w").pack(fill="x")
+        tk.Button(action, text="一键同步全部 Session 可见性", command=self.sync_history, bg="#5c3d99", fg="white", relief="flat", pady=4).pack(fill="x", pady=(0, 4))
+        tk.Label(
+            action,
+            text="说明：可见性同步是独立的手动操作；路线切换和启动不会扫描 Session。",
+            fg="#666",
+            font=("", 8),
+            justify="left",
+            wraplength=420,
+        ).pack(fill="x", pady=(2, 0))
         self.status_var = tk.StringVar(value="选择 Codex 路线后操作")
         tk.Label(right, textvariable=self.status_var, fg="#777", font=("", 8), wraplength=420, justify="left").pack(anchor="w", pady=(4, 0))
 
@@ -671,14 +893,9 @@ class CodexPanel(tk.Frame):
 
     def _apply(self, route):
         backup = _write_codex_config(route)
-        history = None
-        if self.sync_history_var.get():
-            history = sync_codex_history_provider(route["provider_id"])
         self.refresh_status()
         backup_note = "，已备份 config.toml" if backup else ""
-        history_note = f"，同步 {history[0]} 个历史文件" if history else ""
-        self.status_var.set(f"已应用：{route['name']}{backup_note}{history_note}")
-        return history
+        self.status_var.set(f"已应用：{route['name']}{backup_note}")
 
     def apply_global(self):
         route = self._selected_route()
@@ -695,25 +912,45 @@ class CodexPanel(tk.Frame):
         if route is None:
             return
         try:
-            count, manifest = sync_codex_history_provider(route["provider_id"])
-            note = f"历史 provider 已同步：{count} 个文件"
-            if manifest:
-                note += f"；备份：{manifest.name}"
+            result = sync_codex_session_visibility(route["provider_id"])
+            note = (
+                f"可见性同步完成：Session {result.rollout_matching}/{result.rollout_total}"
+                f"（改 {result.rollout_updates}）；索引 {result.db_matching}/{result.db_total}"
+                f"（改 {result.db_updates}）；resume 普通会话 {result.picker_visible}"
+            )
+            if result.manifest:
+                note += f"；Session 备份：{result.manifest.name}"
             self.status_var.set(note)
         except Exception as exc:
             messagebox.showerror("历史同步失败", str(exc), parent=self)
 
     def launch(self):
+        self._launch_binary("codex")
+
+    def launch_codexx(self):
+        self._launch_binary("codexx")
+
+    def resume_codex(self):
+        self._launch_binary("codex", resume_all=True)
+
+    def resume_codexx(self):
+        self._launch_binary("codexx", resume_all=True)
+
+    def _launch_binary(self, binary, resume_all=False):
         route = self._selected_route()
         if route is None:
             messagebox.showwarning("提示", "请先选择一条 Codex 路线", parent=self)
             return
+        display_name = "Codexx" if binary == "codexx" else "Codex"
         try:
             self._apply(route)
-            subprocess.Popen(["cmd", "/k", "codex", "--yolo"], creationflags=subprocess.CREATE_NEW_CONSOLE)
-            self.status_var.set(f"已启动 Codex：{route['name']}")
-        except FileNotFoundError:
-            messagebox.showerror("错误", "找不到 codex 命令，请确认 Codex 已安装并在 PATH 中", parent=self)
+            command = _codex_console_command(binary, resume_all)
+            subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            action = "resume --all" if resume_all else "启动"
+            self.status_var.set(f"已{action} {display_name}：{route['name']}")
+        except FileNotFoundError as exc:
+            detail = str(exc) if str(exc) else f"找不到 {display_name} 二进制文件"
+            messagebox.showerror("错误", detail, parent=self)
         except Exception as exc:
             messagebox.showerror("启动失败", str(exc), parent=self)
 

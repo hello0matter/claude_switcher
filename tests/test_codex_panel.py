@@ -116,6 +116,90 @@ class CodexPanelCoreTests(unittest.TestCase):
             self.assertIn(b'event_msg', tail)
             self.assertEqual(provider, "codex_local_access")
 
+    def test_visibility_sync_switches_existing_durable_triggers_to_new_route(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "state_5.sqlite"
+            db = sqlite3.connect(database)
+            with db:
+                db.execute("""
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        model_provider TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        archived INTEGER NOT NULL DEFAULT 0,
+                        preview TEXT NOT NULL DEFAULT '',
+                        source TEXT NOT NULL DEFAULT 'cli'
+                    )
+                """)
+                db.execute(
+                    "INSERT INTO threads (id, model_provider, cwd, preview) VALUES (?, ?, ?, ?)",
+                    ("thread-old", "mc", r"D:\\old", "old session"),
+                )
+            db.close()
+
+            with mock.patch.object(codex_panel, "CODEX_HOME", root), mock.patch.object(
+                codex_panel, "CODEX_SESSION_BACKUP_DIR", root / "session-meta-backups"
+            ), mock.patch.object(
+                codex_panel, "CODEX_DB_BACKUP_DIR", root / "db-backups"
+            ), mock.patch.object(codex_panel, "CODEX_DB_FILE", database):
+                codex_panel.sync_codex_session_visibility("mc")
+                result = codex_panel.sync_codex_session_visibility("cpa")
+
+            db = sqlite3.connect(database)
+            with db:
+                old_row = db.execute(
+                    "SELECT model_provider, cwd FROM threads WHERE id = 'thread-old'"
+                ).fetchone()
+                setting = db.execute(
+                    "SELECT model_provider FROM codex_resume_visibility_settings WHERE id = 1"
+                ).fetchone()[0]
+                db.execute(
+                    "INSERT INTO threads (id, model_provider, cwd, preview) VALUES (?, ?, ?, ?)",
+                    ("thread-new", "another-route", r"E:\\new", "new session"),
+                )
+                new_row = db.execute(
+                    "SELECT model_provider, cwd FROM threads WHERE id = 'thread-new'"
+                ).fetchone()
+            db.close()
+
+            self.assertEqual(result.db_updates, 1)
+            self.assertEqual(result.db_matching, 1)
+            self.assertEqual(setting, "cpa")
+            self.assertEqual(old_row, ("cpa", r"\\?\D:\\old"))
+            self.assertEqual(new_row, ("cpa", r"\\?\E:\\new"))
+
+    def test_codex_and_codexx_console_commands_are_distinct(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codexx = Path(temp_dir) / "codexx.exe"
+            codexx.touch()
+            with mock.patch.object(codex_panel, "CODEXX_EXE", codexx):
+                self.assertEqual(
+                    codex_panel._codex_console_command("codexx", resume_all=True),
+                    ["cmd.exe", "/k", str(codexx), "resume", "--all"],
+                )
+            self.assertEqual(
+                codex_panel._codex_console_command("codex"),
+                ["cmd.exe", "/k", "codex", "--yolo"],
+            )
+
+    def test_applying_route_does_not_scan_or_sync_sessions(self):
+        panel = object.__new__(codex_panel.CodexPanel)
+        panel.refresh_status = mock.Mock()
+        panel.status_var = mock.Mock()
+        route = codex_panel._normalise_route({
+            "name": "Fast route",
+            "provider_id": "fast",
+            "wire_api": "responses",
+        })
+        with mock.patch.object(codex_panel, "_write_codex_config", return_value=None), mock.patch.object(
+            codex_panel, "sync_codex_session_visibility"
+        ) as sync_visibility:
+            panel._apply(route)
+        sync_visibility.assert_not_called()
+        panel.refresh_status.assert_called_once_with()
+        panel.status_var.set.assert_called_once_with("已应用：Fast route")
+
     def test_openai_endpoint_builder(self):
         self.assertEqual(
             codex_panel._openai_url("https://api.example/v1", "responses"),
