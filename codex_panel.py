@@ -40,10 +40,11 @@ CODEXX_EXE = Path(
         CODEX_HOME / ".sandbox-bin" / "codexhistory" / "codexx.exe",
     )
 )
-SESSION_META_PROVIDER = re.compile(rb'("model_provider"\s*:\s*)("(?:[^"\\]|\\.)*")([ \t]*)')
 VISIBILITY_SETTINGS_TABLE = "codex_resume_visibility_settings"
 VISIBILITY_INSERT_TRIGGER = "codex_resume_visibility_after_insert"
 VISIBILITY_UPDATE_TRIGGER = "codex_resume_visibility_after_update"
+ROLLOUT_PROVIDER_SCAN_LIMIT = 1024 * 1024
+ROLLOUT_REWRITE_BUDGET = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class CodexHistorySyncResult:
     db_total: int
     picker_visible: int
     db_backup: Path | None
+    rollout_deferred: int = 0
 
 
 def _now_stamp():
@@ -222,58 +224,107 @@ def _iter_rollouts():
             yield from folder.rglob("*.jsonl")
 
 
+def _find_json_string_field(data, field):
+    key = json.dumps(field).encode("ascii")
+    key_at = data.find(key)
+    if key_at < 0:
+        return None
+    colon_at = data.find(b":", key_at + len(key))
+    if colon_at < 0:
+        return None
+    value_start = colon_at + 1
+    while value_start < len(data) and data[value_start] in b" \t":
+        value_start += 1
+    if value_start >= len(data) or data[value_start] != ord('"'):
+        return None
+    cursor = value_start + 1
+    while cursor < len(data):
+        byte = data[cursor]
+        if byte == ord("\\"):
+            cursor += 2
+            continue
+        if byte == ord('"'):
+            literal_end = cursor + 1
+            padded_end = literal_end
+            while padded_end < len(data) and data[padded_end] in b" \t":
+                padded_end += 1
+            return value_start, literal_end, padded_end
+        cursor += 1
+    return None
+
+
 def _plan_rollout_provider(path, target_provider):
+    prefix = bytearray()
+    field_bounds = None
     with path.open("rb") as stream:
-        first_line = stream.readline()
+        while len(prefix) < ROLLOUT_PROVIDER_SCAN_LIMIT:
+            chunk = stream.read(min(64 * 1024, ROLLOUT_PROVIDER_SCAN_LIMIT - len(prefix)))
+            if not chunk:
+                break
+            prefix.extend(chunk)
+            field_bounds = _find_json_string_field(prefix, "model_provider")
+            if field_bounds is not None or b"\n" in chunk:
+                break
+    if field_bounds is None:
+        return None
+    value_start, literal_end, padded_end = field_bounds
+    newline_at = prefix.find(b"\n")
+    if newline_at >= 0 and value_start > newline_at:
+        return None
+    old_literal = bytes(prefix[value_start:literal_end])
     try:
-        metadata = json.loads(first_line)
+        current = json.loads(old_literal)
     except (UnicodeDecodeError, ValueError):
         return None
-    if metadata.get("type") != "session_meta":
-        return None
-    match = SESSION_META_PROVIDER.search(first_line)
-    if match is None:
-        return None
-    current = json.loads(match.group(2))
     if current == target_provider:
         return False
+
     replacement = json.dumps(target_provider, ensure_ascii=True).encode("ascii")
-    available = len(match.group(2)) + len(match.group(3))
+    old_bytes = bytes(prefix[value_start:padded_end])
+    available = len(old_bytes)
     if len(replacement) <= available:
-        padded = replacement + b" " * (available - len(replacement))
-        new_line = first_line[:match.start(2)] + padded + first_line[match.end(2):]
+        new_bytes = replacement + b" " * (available - len(replacement))
+        mode = "inplace"
     else:
-        new_line = first_line[:match.start(2)] + replacement + first_line[match.end(2):]
-    if json.loads(new_line)["payload"].get("model_provider") != target_provider:
-        return None
-    return {"path": path, "old_line": first_line, "new_line": new_line}
+        new_bytes = replacement
+        mode = "rewrite"
+    return {
+        "path": path,
+        "offset": value_start,
+        "old_bytes": old_bytes,
+        "new_bytes": new_bytes,
+        "mode": mode,
+        "file_size": path.stat().st_size,
+    }
 
 
 def _apply_rollout_provider_plan(plan):
     path = plan["path"]
-    old_line = plan["old_line"]
-    new_line = plan["new_line"]
-    if len(old_line) == len(new_line):
+    offset = plan["offset"]
+    old_bytes = plan["old_bytes"]
+    new_bytes = plan["new_bytes"]
+    if plan["mode"] == "inplace":
         with path.open("r+b") as stream:
-            if stream.readline() != old_line:
+            stream.seek(offset)
+            if stream.read(len(old_bytes)) != old_bytes:
                 return False
-            stream.seek(0)
-            stream.write(new_line)
+            stream.seek(offset)
+            stream.write(new_bytes)
             stream.flush()
-            os.fsync(stream.fileno())
         return True
 
     temp_name = None
     try:
         with path.open("rb") as source:
-            if source.readline() != old_line:
-                return False
-            temp_fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-            with os.fdopen(temp_fd, "wb") as target:
-                target.write(new_line)
-                shutil.copyfileobj(source, target, length=1024 * 1024)
-                target.flush()
-                os.fsync(target.fileno())
+            data = source.read()
+        if data[offset:offset + len(old_bytes)] != old_bytes:
+            return False
+        updated = data[:offset] + new_bytes + data[offset + len(old_bytes):]
+        temp_fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+        with os.fdopen(temp_fd, "wb") as target:
+            target.write(updated)
+            target.flush()
+            os.fsync(target.fileno())
         os.replace(temp_name, path)
         return True
     except OSError:
@@ -459,27 +510,37 @@ def _sync_codex_history_db(provider_id):
             db.close()
 
 
-def sync_codex_session_visibility(provider_id):
+def sync_codex_session_visibility(provider_id, sync_rollouts=False):
     plans = []
+    deferred = []
     rollout_total = 0
     already_matching = 0
-    for path in _iter_rollouts():
-        plan = _plan_rollout_provider(path, provider_id)
-        if isinstance(plan, dict):
-            plans.append(plan)
-            rollout_total += 1
-        elif plan is False:
-            rollout_total += 1
-            already_matching += 1
+    if sync_rollouts:
+        rewrite_budget = ROLLOUT_REWRITE_BUDGET
+        for path in _iter_rollouts():
+            plan = _plan_rollout_provider(path, provider_id)
+            if isinstance(plan, dict):
+                rollout_total += 1
+                if plan["mode"] == "rewrite":
+                    if plan["file_size"] > rewrite_budget:
+                        deferred.append(plan)
+                        continue
+                    rewrite_budget -= plan["file_size"]
+                plans.append(plan)
+            elif plan is False:
+                rollout_total += 1
+                already_matching += 1
+
     manifest = None
     if plans:
         CODEX_SESSION_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        manifest = CODEX_SESSION_BACKUP_DIR / f"provider-lines-app-{_now_stamp()}.jsonl"
+        manifest = CODEX_SESSION_BACKUP_DIR / f"provider-bytes-app-{_now_stamp()}.jsonl"
         with manifest.open("w", encoding="utf-8") as stream:
             for plan in plans:
                 stream.write(json.dumps({
                     "path": str(plan["path"]),
-                    "line": base64.b64encode(plan["old_line"]).decode("ascii"),
+                    "offset": plan["offset"],
+                    "bytes": base64.b64encode(plan["old_bytes"]).decode("ascii"),
                 }, ensure_ascii=False) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -495,12 +556,13 @@ def sync_codex_session_visibility(provider_id):
         db_total=db_result["total"],
         picker_visible=db_result["picker_visible"],
         db_backup=db_result["backup"],
+        rollout_deferred=len(deferred),
     )
 
 
 def sync_codex_history_provider(provider_id):
     """Backward-compatible wrapper for callers expecting the original tuple."""
-    result = sync_codex_session_visibility(provider_id)
+    result = sync_codex_session_visibility(provider_id, sync_rollouts=True)
     return result.rollout_updates, result.manifest
 
 
@@ -792,10 +854,10 @@ class CodexPanel(tk.Frame):
         tk.Button(resume_row, text="Codexx resume --all", command=self.resume_codexx, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(2, 0))
         tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
         tk.Button(action, text="一键同步全部 Session 可见性", command=self.sync_history, bg="#5c3d99", fg="white", relief="flat", pady=4).pack(fill="x", pady=(0, 4))
-        tk.Checkbutton(action, text="切换/启动时自动同步 Session 可见性（可选，较慢）", variable=self.sync_history_var, anchor="w").pack(fill="x")
+        tk.Checkbutton(action, text="切换/启动时自动同步 Session 可见性（可选）", variable=self.sync_history_var, anchor="w").pack(fill="x")
         tk.Label(
             action,
-            text="说明：默认不自动扫描 Session，切换更快；需要时可勾选自动同步。",
+            text="说明：快速同步只更新 resume 索引，不再遍历约 5.9GB 的 Session 文件。",
             fg="#666",
             font=("", 8),
             justify="left",
@@ -902,10 +964,7 @@ class CodexPanel(tk.Frame):
         backup_note = "，已备份 config.toml" if backup else ""
         history_note = ""
         if history:
-            history_note = (
-                f"，Session {history.rollout_matching}/{history.rollout_total}"
-                f"，索引 {history.db_matching}/{history.db_total}"
-            )
+            history_note = f"，索引 {history.db_matching}/{history.db_total}"
         self.status_var.set(f"已应用：{route['name']}{backup_note}{history_note}")
         return history
 
@@ -926,12 +985,9 @@ class CodexPanel(tk.Frame):
         try:
             result = sync_codex_session_visibility(route["provider_id"])
             note = (
-                f"可见性同步完成：Session {result.rollout_matching}/{result.rollout_total}"
-                f"（改 {result.rollout_updates}）；索引 {result.db_matching}/{result.db_total}"
+                f"快速同步完成：索引 {result.db_matching}/{result.db_total}"
                 f"（改 {result.db_updates}）；resume 普通会话 {result.picker_visible}"
             )
-            if result.manifest:
-                note += f"；Session 备份：{result.manifest.name}"
             self.status_var.set(note)
         except Exception as exc:
             messagebox.showerror("历史同步失败", str(exc), parent=self)

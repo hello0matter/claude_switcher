@@ -183,6 +183,36 @@ class CodexPanelCoreTests(unittest.TestCase):
                 ["cmd.exe", "/k", "codex", "--yolo"],
             )
 
+    def test_fast_visibility_sync_does_not_scan_rollout_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "state_5.sqlite"
+            db = sqlite3.connect(database)
+            with db:
+                db.execute("""
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        model_provider TEXT NOT NULL,
+                        archived INTEGER NOT NULL DEFAULT 0,
+                        preview TEXT NOT NULL DEFAULT '',
+                        source TEXT NOT NULL DEFAULT 'cli'
+                    )
+                """)
+                db.execute(
+                    "INSERT INTO threads (id, model_provider, preview) VALUES (?, ?, ?)",
+                    ("thread-fast", "old", "visible session"),
+                )
+            db.close()
+            with mock.patch.object(codex_panel, "CODEX_DB_FILE", database), mock.patch.object(
+                codex_panel, "CODEX_DB_BACKUP_DIR", root / "db-backups"
+            ), mock.patch.object(
+                codex_panel, "_iter_rollouts", side_effect=AssertionError("rollouts scanned")
+            ):
+                result = codex_panel.sync_codex_session_visibility("fast")
+            self.assertEqual(result.rollout_total, 0)
+            self.assertEqual(result.db_matching, 1)
+            self.assertEqual(result.picker_visible, 1)
+
     def test_applying_route_does_not_sync_sessions_when_option_is_off(self):
         panel = object.__new__(codex_panel.CodexPanel)
         panel.refresh_status = mock.Mock()
@@ -230,7 +260,7 @@ class CodexPanelCoreTests(unittest.TestCase):
             panel._apply(route)
         sync_visibility.assert_called_once_with("compatible")
         panel.status_var.set.assert_called_once_with(
-            "已应用：Compatible route，Session 10/10，索引 9/9"
+            "已应用：Compatible route，索引 9/9"
         )
 
     def test_openai_endpoint_builder(self):
