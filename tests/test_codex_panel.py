@@ -236,6 +236,61 @@ class CodexPanelCoreTests(unittest.TestCase):
         panel.refresh_status.assert_called_once_with()
         panel.status_var.set.assert_called_once_with("已应用：Fast route")
 
+    def test_resume_database_optimizer_removes_old_sync_and_compacts_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "state_5.sqlite"
+            db = sqlite3.connect(database)
+            with db:
+                db.execute("""
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        first_user_message TEXT NOT NULL,
+                        preview TEXT NOT NULL,
+                        model_provider TEXT NOT NULL
+                    )
+                """)
+                db.execute("""
+                    CREATE TABLE codex_resume_visibility_settings (
+                        id INTEGER PRIMARY KEY,
+                        model_provider TEXT NOT NULL
+                    )
+                """)
+                db.execute("""
+                    CREATE TRIGGER codex_resume_visibility_after_insert
+                    AFTER INSERT ON threads BEGIN SELECT 1; END
+                """)
+                db.execute("""
+                    CREATE TRIGGER codex_resume_visibility_after_update
+                    AFTER UPDATE ON threads BEGIN SELECT 1; END
+                """)
+                db.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?, ?)",
+                    ("thread-1", "t" * 5000, "m" * 5000, "p" * 5000, "test"),
+                )
+            db.close()
+
+            with mock.patch.object(codex_panel, "CODEX_DB_FILE", database):
+                result = codex_panel.optimize_codex_resume_database()
+
+            db = sqlite3.connect(database)
+            lengths = db.execute("""
+                SELECT length(title), length(first_user_message), length(preview)
+                FROM threads
+            """).fetchone()
+            old_objects = db.execute("""
+                SELECT name FROM sqlite_master
+                WHERE name LIKE 'codex_resume_visibility_%'
+            """).fetchall()
+            integrity = db.execute("PRAGMA quick_check").fetchone()[0]
+            db.close()
+            self.assertEqual(lengths, (512, 2048, 2048))
+            self.assertEqual(old_objects, [])
+            self.assertEqual(integrity, "ok")
+            self.assertEqual(result.truncated_rows, 1)
+            self.assertTrue(result.removed_visibility_sync)
+            self.assertTrue(result.vacuumed)
+
     def test_resume_picker_does_not_apply_selected_route(self):
         panel = object.__new__(codex_panel.CodexPanel)
         panel._launch_binary = mock.Mock()

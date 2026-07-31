@@ -61,6 +61,16 @@ class CodexHistorySyncResult:
     rollout_deferred: int = 0
 
 
+@dataclass(frozen=True)
+class CodexDatabaseOptimizeResult:
+    size_before: int
+    size_after: int
+    logical_size_after: int
+    truncated_rows: int
+    removed_visibility_sync: bool
+    vacuumed: bool
+
+
 def _now_stamp():
     return dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
@@ -566,6 +576,98 @@ def sync_codex_history_provider(provider_id):
     return result.rollout_updates, result.manifest
 
 
+def optimize_codex_resume_database():
+    """Compact resume metadata without modifying the actual rollout transcripts."""
+    if not CODEX_DB_FILE.exists():
+        raise FileNotFoundError(f"找不到 Codex 数据库：{CODEX_DB_FILE}")
+
+    size_before = CODEX_DB_FILE.stat().st_size
+    db = sqlite3.connect(CODEX_DB_FILE, timeout=10)
+    truncated_rows = 0
+    removed_visibility_sync = False
+    vacuum_succeeded = False
+    page_size = 0
+    page_count = 0
+    try:
+        db.execute("PRAGMA busy_timeout = 10000")
+        if not _table_exists(db, "threads"):
+            raise RuntimeError("Codex 数据库缺少 threads 表")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
+        display_columns = {"title", "first_user_message", "preview"}
+        if not display_columns.issubset(columns):
+            raise RuntimeError("Codex 数据库版本不支持 resume 元数据优化")
+
+        trigger_count = db.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
+            (VISIBILITY_INSERT_TRIGGER, VISIBILITY_UPDATE_TRIGGER),
+        ).fetchone()[0]
+        removed_visibility_sync = bool(
+            trigger_count or _table_exists(db, VISIBILITY_SETTINGS_TABLE)
+        )
+        truncated_rows = db.execute("""
+            SELECT COUNT(*)
+            FROM threads
+            WHERE length(title) > 512
+               OR length(first_user_message) > 2048
+               OR length(preview) > 2048
+        """).fetchone()[0]
+
+        with db:
+            db.execute(f"DROP TRIGGER IF EXISTS {VISIBILITY_INSERT_TRIGGER}")
+            db.execute(f"DROP TRIGGER IF EXISTS {VISIBILITY_UPDATE_TRIGGER}")
+            db.execute(f"DROP TABLE IF EXISTS {VISIBILITY_SETTINGS_TABLE}")
+            db.execute("""
+                UPDATE threads
+                SET title = CASE
+                        WHEN length(title) > 512 THEN substr(title, 1, 512)
+                        ELSE title
+                    END,
+                    first_user_message = CASE
+                        WHEN length(first_user_message) > 2048
+                            THEN substr(first_user_message, 1, 2048)
+                        ELSE first_user_message
+                    END,
+                    preview = CASE
+                        WHEN length(preview) > 2048 THEN substr(preview, 1, 2048)
+                        ELSE preview
+                    END
+                WHERE length(title) > 512
+                   OR length(first_user_message) > 2048
+                   OR length(preview) > 2048
+            """)
+
+        db.execute("PRAGMA optimize")
+        db.commit()
+        try:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            db.execute("VACUUM")
+            vacuum_succeeded = True
+        except sqlite3.OperationalError:
+            # Active Codex processes can temporarily prevent VACUUM. The metadata
+            # cleanup is already committed and a later manual run can compact it.
+            vacuum_succeeded = False
+        page_size = db.execute("PRAGMA page_size").fetchone()[0]
+        page_count = db.execute("PRAGMA page_count").fetchone()[0]
+        if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise RuntimeError("Codex 数据库完整性检查失败")
+    except sqlite3.Error as exc:
+        raise RuntimeError("Codex resume 数据库优化失败") from exc
+    finally:
+        db.close()
+
+    size_after = CODEX_DB_FILE.stat().st_size
+    logical_size_after = page_size * page_count
+    vacuumed = vacuum_succeeded and size_after <= logical_size_after + page_size
+    return CodexDatabaseOptimizeResult(
+        size_before=size_before,
+        size_after=size_after,
+        logical_size_after=logical_size_after,
+        truncated_rows=truncated_rows,
+        removed_visibility_sync=removed_visibility_sync,
+        vacuumed=vacuumed,
+    )
+
+
 def _codex_console_command(binary, action="launch", session_id=None):
     if binary == "codex":
         executable = os.environ.get("CODEX_COMMAND", "codex")
@@ -873,6 +975,7 @@ class CodexPanel(tk.Frame):
         tk.Button(restore_row, text="按 ID 恢复 Codex", command=self.resume_codex_id, bg="#238636", fg="white", relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(0, 2))
         tk.Button(restore_row, text="按 ID 恢复 Codexx", command=self.resume_codexx_id, bg="#1f6f9f", fg="white", relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(2, 0))
 
+        tk.Button(action, text="手动优化 resume 数据库", command=self.optimize_resume_database, relief="flat", pady=4).pack(fill="x", pady=(0, 4))
         tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
         tk.Label(
             action,
@@ -1022,6 +1125,21 @@ class CodexPanel(tk.Frame):
             messagebox.showwarning("提示", "请先粘贴 Session ID", parent=self)
             return
         self._launch_binary(binary, action="resume_id", session_id=session_id)
+
+    def optimize_resume_database(self):
+        try:
+            result = optimize_codex_resume_database()
+            before_mb = result.size_before / (1024 * 1024)
+            after_mb = result.size_after / (1024 * 1024)
+            logical_mb = result.logical_size_after / (1024 * 1024)
+            compact_note = "" if result.vacuumed else "；有 Codex 正在占用，压缩将在下次重试"
+            self.status_var.set(
+                f"resume 数据库已优化：有效数据 {before_mb:.1f} MB → {logical_mb:.1f} MB"
+                f"（文件 {after_mb:.1f} MB）；"
+                f"清理 {result.truncated_rows} 条过大索引{compact_note}"
+            )
+        except Exception as exc:
+            messagebox.showerror("数据库优化失败", str(exc), parent=self)
 
     def _launch_binary(self, binary, action="launch", session_id=None, apply_route=True):
         route = self._selected_route() if apply_route else None
