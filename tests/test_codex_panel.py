@@ -291,6 +291,54 @@ class CodexPanelCoreTests(unittest.TestCase):
             self.assertTrue(result.removed_visibility_sync)
             self.assertTrue(result.vacuumed)
 
+    def test_align_one_session_provider_updates_db_and_rollout_meta(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sessions = root / "sessions" / "2026" / "01" / "01"
+            sessions.mkdir(parents=True)
+            rollout = sessions / "rollout-2026-01-01T00-00-00-019f-test.jsonl"
+            first = json.dumps({
+                "type": "session_meta",
+                "payload": {
+                    "id": "019f-test-session",
+                    "cwd": r"D:\\project",
+                    "source": "cli",
+                    "model_provider": "cpa",
+                },
+            }, separators=(",", ":")).encode() + b"\n"
+            rollout.write_bytes(first + b'{"type":"event_msg","payload":{}}\n')
+            database = root / "state_5.sqlite"
+            db = sqlite3.connect(database)
+            with db:
+                db.execute("""
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        model_provider TEXT NOT NULL,
+                        rollout_path TEXT NOT NULL
+                    )
+                """)
+                db.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?)",
+                    ("019f-test-session", "mc", str(rollout)),
+                )
+            db.close()
+
+            with mock.patch.object(codex_panel, "CODEX_DB_FILE", database):
+                result = codex_panel.align_codex_session_provider(
+                    "019f-test-session", "xin gpt5.6sol"
+                )
+
+            db = sqlite3.connect(database)
+            provider = db.execute(
+                "SELECT model_provider FROM threads WHERE id = ?",
+                ("019f-test-session",),
+            ).fetchone()[0]
+            db.close()
+            updated = json.loads(rollout.read_bytes().splitlines()[0])
+            self.assertEqual(provider, "xin gpt5.6sol")
+            self.assertEqual(updated["payload"]["model_provider"], "xin gpt5.6sol")
+            self.assertEqual(result, {"db_updated": True, "rollout_updated": True})
+
     def test_resume_picker_does_not_apply_selected_route(self):
         panel = object.__new__(codex_panel.CodexPanel)
         panel._launch_binary = mock.Mock()

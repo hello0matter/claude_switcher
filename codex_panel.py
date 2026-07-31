@@ -668,6 +668,54 @@ def optimize_codex_resume_database():
     )
 
 
+def align_codex_session_provider(session_id, provider_id):
+    """Align one explicitly resumed session with the route being used.
+
+    This deliberately touches only the requested session. Older global visibility
+    synchronization changed hundreds of unrelated sessions and made route filters
+    misleading; an explicit ID resume is the safe point to repair one stale entry.
+    """
+    if not CODEX_DB_FILE.exists():
+        return {"db_updated": False, "rollout_updated": False}
+
+    db = sqlite3.connect(CODEX_DB_FILE, timeout=10)
+    try:
+        db.execute("PRAGMA busy_timeout = 10000")
+        row = db.execute(
+            "SELECT model_provider, rollout_path FROM threads WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return {"db_updated": False, "rollout_updated": False}
+
+        old_provider, rollout_path = row
+        rollout_updated = False
+        if rollout_path:
+            path = Path(rollout_path)
+            if path.is_file():
+                try:
+                    plan = _plan_rollout_provider(path, provider_id)
+                    if isinstance(plan, dict):
+                        rollout_updated = _apply_rollout_provider_plan(plan)
+                except OSError:
+                    # Do not block direct ID resume merely because another Codex
+                    # process temporarily holds the rollout file open.
+                    rollout_updated = False
+
+        db_updated = old_provider != provider_id
+        if db_updated:
+            with db:
+                db.execute(
+                    "UPDATE threads SET model_provider = ? WHERE id = ?",
+                    (provider_id, session_id),
+                )
+        return {"db_updated": db_updated, "rollout_updated": rollout_updated}
+    except sqlite3.Error as exc:
+        raise RuntimeError("无法修复该 Session 的 Codex 路线索引") from exc
+    finally:
+        db.close()
+
+
 def _codex_console_command(binary, action="launch", session_id=None):
     if binary == "codex":
         executable = os.environ.get("CODEX_COMMAND", "codex")
@@ -979,7 +1027,7 @@ class CodexPanel(tk.Frame):
         tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
         tk.Label(
             action,
-            text="流程：先打开当前目录的 resume，Ctrl+E 展开复制 ID；再选路线，按 ID 直接恢复。不做 Session 可见性同步。",
+            text="流程：先打开当前目录的 resume，Ctrl+E 展开复制 ID；再选路线，按 ID 直接恢复。不会全局同步，只修正该 Session 的路线索引。",
             fg="#666",
             font=("", 8),
             justify="left",
@@ -1150,6 +1198,13 @@ class CodexPanel(tk.Frame):
         try:
             if route is not None:
                 self._apply(route)
+            sync_note = ""
+            if session_id and route:
+                sync_result = align_codex_session_provider(
+                    session_id, route["provider_id"]
+                )
+                if sync_result["db_updated"] or sync_result["rollout_updated"]:
+                    sync_note = "（该 Session 索引已对齐当前路线）"
             command = _codex_console_command(binary, action, session_id)
             subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_CONSOLE)
             action_text = {
@@ -1158,7 +1213,7 @@ class CodexPanel(tk.Frame):
                 "resume_id": f"按 ID 恢复 {display_name}",
             }[action]
             route_note = f"：{route['name']}" if route else ""
-            self.status_var.set(action_text + route_note)
+            self.status_var.set(action_text + route_note + sync_note)
         except FileNotFoundError as exc:
             detail = str(exc) if str(exc) else f"找不到 {display_name} 二进制文件"
             messagebox.showerror("错误", detail, parent=self)
