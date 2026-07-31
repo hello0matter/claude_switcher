@@ -175,8 +175,8 @@ class CodexPanelCoreTests(unittest.TestCase):
             codexx.touch()
             with mock.patch.object(codex_panel, "CODEXX_EXE", codexx):
                 self.assertEqual(
-                    codex_panel._codex_console_command("codexx", resume_all=True),
-                    ["cmd.exe", "/k", str(codexx), "resume", "--all"],
+                    codex_panel._codex_console_command("codexx", action="resume"),
+                    ["cmd.exe", "/k", str(codexx), "resume"],
                 )
             self.assertEqual(
                 codex_panel._codex_console_command("codex"),
@@ -184,7 +184,7 @@ class CodexPanelCoreTests(unittest.TestCase):
             )
             self.assertEqual(
                 codex_panel._codex_console_command(
-                    "codex", session_id="019f-test-session"
+                    "codex", action="resume_id", session_id="019f-test-session"
                 ),
                 ["cmd.exe", "/k", "codex", "resume", "019f-test-session"],
             )
@@ -241,7 +241,7 @@ class CodexPanelCoreTests(unittest.TestCase):
         panel._launch_binary = mock.Mock()
         panel.resume_codex()
         panel._launch_binary.assert_called_once_with(
-            "codex", resume_all=True, apply_route=False
+            "codex", action="resume", apply_route=False
         )
 
     def test_openai_endpoint_builder(self):

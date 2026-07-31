@@ -166,31 +166,6 @@ def apply_api_auth(env, api_key, auth_var):
         return
     env[auth_var] = api_key
 
-def build_shell_env(route):
-    """Build the same Claude env vars used by the global switcher."""
-    env = {}
-    clears = {
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-    }
-    if not route.get("oauth_json") and route.get("base_url"):
-        env["ANTHROPIC_BASE_URL"] = route["base_url"]
-    if route.get("model"):
-        env["ANTHROPIC_MODEL"] = route["model"]
-    if not route.get("oauth_json") and route.get("api_key"):
-        env[route_auth_var(route)] = route["api_key"]
-    return env, clears - set(env)
-
-def build_powershell_env_command(route):
-    env, clears = build_shell_env(route)
-    parts = [f"Remove-Item Env:{name} -ErrorAction SilentlyContinue" for name in sorted(clears)]
-    for name, value in env.items():
-        escaped = str(value).replace("'", "''")
-        parts.append(f"$env:{name}='{escaped}'")
-    return "; ".join(parts)
-
 def clean_claude_launch_env(env):
     for name in (
         "ANTHROPIC_API_KEY",
@@ -1352,16 +1327,9 @@ class App(tk.Tk):
             sync_clawgod_warlord(r)
         self._refresh_global_status()
         extra = "，ClawGod 已同步" if self.sync_clawgod_var.get() else ""
-        ps_cmd = build_powershell_env_command(r)
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(ps_cmd)
-            clip_note = "；当前 WT/Powershell 刷新命令已复制"
-        except tk.TclError:
-            clip_note = ""
         self.status_var.set(
-            f"已设为全局：{r['name']}（注册表 + settings.json 已更新{extra}{clip_note}；"
-            "粘贴到当前 WT/Powershell 后 Ctrl+C + resume 生效）"
+            f"已设为全局：{r['name']}（注册表 + settings.json 已更新{extra}；"
+            "已运行的 Claude 不会自动切换：只改模型请用 /model，切换路线请重新启动）"
         )
 
     def _clear_global(self):
