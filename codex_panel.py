@@ -716,26 +716,35 @@ def align_codex_session_provider(session_id, provider_id):
         db.close()
 
 
+def _powershell_console() -> str:
+    return shutil.which("pwsh.exe") or shutil.which("powershell.exe") or "powershell.exe"
+
+
+def _powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _codex_console_command(binary, action="launch", session_id=None):
     if binary == "codex":
         executable = os.environ.get("CODEX_COMMAND", "codex")
     elif binary == "codexx":
         if not CODEXX_EXE.is_file():
-            raise FileNotFoundError(f"找不到 Codexx：{CODEXX_EXE}")
+            raise FileNotFoundError(f"??? Codexx?{CODEXX_EXE}")
         executable = str(CODEXX_EXE)
     else:
-        raise ValueError(f"未知 Codex 二进制：{binary}")
+        raise ValueError(f"?? Codex ????{binary}")
     if action == "resume_id":
         if not session_id:
-            raise ValueError("缺少 Codex Session ID")
+            raise ValueError("?? Codex Session ID")
         arguments = ["resume", session_id]
     elif action == "resume":
         arguments = ["resume"]
     elif action == "launch":
         arguments = ["--yolo"]
     else:
-        raise ValueError(f"未知 Codex 操作：{action}")
-    return ["cmd.exe", "/k", executable, *arguments]
+        raise ValueError(f"?? Codex ???{action}")
+    invocation = "& " + " ".join(_powershell_quote(value) for value in [executable, *arguments])
+    return [_powershell_console(), "-NoExit", "-Command", invocation]
 
 
 def _openai_url(base_url, endpoint):

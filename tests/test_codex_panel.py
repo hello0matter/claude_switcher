@@ -169,25 +169,32 @@ class CodexPanelCoreTests(unittest.TestCase):
             self.assertEqual(old_row, ("cpa", r"\\?\D:\\old"))
             self.assertEqual(new_row, ("cpa", r"\\?\E:\\new"))
 
-    def test_codex_and_codexx_console_commands_are_distinct(self):
+    def test_codex_and_codexx_console_commands_use_powershell(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             codexx = Path(temp_dir) / "codexx.exe"
             codexx.touch()
-            with mock.patch.object(codex_panel, "CODEXX_EXE", codexx):
+            with mock.patch.object(codex_panel, "CODEXX_EXE", codexx), mock.patch.object(
+                codex_panel, "_powershell_console", return_value="pwsh.exe"
+            ):
                 self.assertEqual(
                     codex_panel._codex_console_command("codexx", action="resume"),
-                    ["cmd.exe", "/k", str(codexx), "resume"],
+                    ["pwsh.exe", "-NoExit", "-Command", f"& '{codexx}' 'resume'"],
                 )
-            self.assertEqual(
-                codex_panel._codex_console_command("codex"),
-                ["cmd.exe", "/k", "codex", "--yolo"],
-            )
-            self.assertEqual(
-                codex_panel._codex_console_command(
-                    "codex", action="resume_id", session_id="019f-test-session"
-                ),
-                ["cmd.exe", "/k", "codex", "resume", "019f-test-session"],
-            )
+                self.assertEqual(
+                    codex_panel._codex_console_command("codex"),
+                    ["pwsh.exe", "-NoExit", "-Command", "& 'codex' '--yolo'"],
+                )
+                self.assertEqual(
+                    codex_panel._codex_console_command(
+                        "codex", action="resume_id", session_id="019f-test-session"
+                    ),
+                    [
+                        "pwsh.exe",
+                        "-NoExit",
+                        "-Command",
+                        "& 'codex' 'resume' '019f-test-session'",
+                    ],
+                )
 
     def test_fast_visibility_sync_does_not_scan_rollout_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
