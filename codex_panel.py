@@ -37,7 +37,7 @@ CODEX_DB_FILE = CODEX_HOME / "state_5.sqlite"
 CODEXX_EXE = Path(
     os.environ.get(
         "CODEXX_EXE",
-        CODEX_HOME / ".sandbox-bin" / "codexx.exe",
+        CODEX_HOME / ".sandbox-bin" / "codexhistory" / "codexx.exe",
     )
 )
 VISIBILITY_SETTINGS_TABLE = "codex_resume_visibility_settings"

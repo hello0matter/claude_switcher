@@ -9,6 +9,10 @@ import codex_panel
 
 
 class CodexPanelCoreTests(unittest.TestCase):
+    def test_default_codexx_path_uses_history_binary(self):
+        expected = Path.home() / ".codex" / ".sandbox-bin" / "codexhistory" / "codexx.exe"
+        self.assertEqual(codex_panel.CODEXX_EXE, expected)
+
     def test_routes_import_from_existing_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
