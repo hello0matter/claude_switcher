@@ -9,8 +9,8 @@ import codex_panel
 
 
 class CodexPanelCoreTests(unittest.TestCase):
-    def test_default_codexx_path_uses_history_binary(self):
-        expected = Path.home() / ".codex" / ".sandbox-bin" / "codexhistory" / "codexx.exe"
+    def test_default_codexx_path_uses_sandbox_binary(self):
+        expected = Path.home() / ".codex" / ".sandbox-bin" / "codexx.exe"
         self.assertEqual(codex_panel.CODEXX_EXE, expected)
 
     def test_routes_import_from_existing_config(self):
