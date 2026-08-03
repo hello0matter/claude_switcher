@@ -772,14 +772,26 @@ def test_codex_model(route, model, timeout=30):
         payload = {"model": model, "prompt": "Reply with OK.", "max_tokens": 16}
     else:
         endpoint = "responses"
-        payload = {"model": model, "input": "Reply with OK.", "max_output_tokens": 16}
+        # Match Codex's streaming request shape. Some Responses gateways reject
+        # max_output_tokens on this lightweight probe even though Codex itself
+        # works with the model.
+        payload = {
+            "model": model,
+            "input": "Reply with OK only.",
+            "stream": True,
+            "store": False,
+        }
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(_openai_url(route.get("base_url"), endpoint), data=body, headers=headers, method="POST")
     started = time.perf_counter()
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read(4096)
-        return True, f"{(time.perf_counter() - started) * 1000:.0f}", ""
+            body = response.read(8192).decode("utf-8", errors="replace")
+            status = response.status
+        latency = f"{(time.perf_counter() - started) * 1000:.0f}"
+        if '"type":"error"' in body or '"type":"response.failed"' in body:
+            return False, latency, f"HTTP {status}: {body[:500]}"
+        return True, latency, f"HTTP {status}"
     except urllib.error.HTTPError as exc:
         detail = exc.read(500).decode("utf-8", errors="replace")
         return False, f"{(time.perf_counter() - started) * 1000:.0f}", f"HTTP {exc.code}: {detail}"

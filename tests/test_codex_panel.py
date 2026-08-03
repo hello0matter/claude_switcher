@@ -13,6 +13,30 @@ class CodexPanelCoreTests(unittest.TestCase):
         expected = Path.home() / ".codex" / ".sandbox-bin" / "codexx.exe"
         self.assertEqual(codex_panel.CODEXX_EXE, expected)
 
+    def test_responses_model_test_matches_streaming_codex_request(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b'event: response.created\\ndata: {"type":"response.created"}\\n\\n'
+        context = mock.MagicMock()
+        context.__enter__.return_value = response
+        with mock.patch.object(codex_panel.urllib.request, "urlopen", return_value=context) as urlopen:
+            result = codex_panel.test_codex_model(
+                {
+                    "base_url": "https://api.example/v1",
+                    "api_key": "test-key",
+                    "wire_api": "responses",
+                },
+                "gpt-test",
+            )
+
+        self.assertEqual(result[0], True)
+        self.assertEqual(result[2], "HTTP 200")
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(payload["model"], "gpt-test")
+        self.assertTrue(payload["stream"])
+        self.assertFalse(payload["store"])
+        self.assertNotIn("max_output_tokens", payload)
+
     def test_routes_import_from_existing_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
