@@ -197,7 +197,7 @@ class CodexPanelCoreTests(unittest.TestCase):
             self.assertEqual(old_row, ("cpa", r"\\?\D:\\old"))
             self.assertEqual(new_row, ("cpa", r"\\?\E:\\new"))
 
-    def test_codex_and_codexx_console_commands_use_powershell(self):
+    def test_codex_and_codexx_launch_commands_use_powershell(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             codexx = Path(temp_dir) / "codexx.exe"
             codexx.touch()
@@ -205,23 +205,12 @@ class CodexPanelCoreTests(unittest.TestCase):
                 codex_panel, "_powershell_console", return_value="pwsh.exe"
             ):
                 self.assertEqual(
-                    codex_panel._codex_console_command("codexx", action="resume"),
-                    ["pwsh.exe", "-NoExit", "-Command", f"& '{codexx}' 'resume'"],
+                    codex_panel._codex_console_command("codexx"),
+                    ["pwsh.exe", "-NoExit", "-Command", f"& '{codexx}' '--yolo'"],
                 )
                 self.assertEqual(
                     codex_panel._codex_console_command("codex"),
                     ["pwsh.exe", "-NoExit", "-Command", "& 'codex' '--yolo'"],
-                )
-                self.assertEqual(
-                    codex_panel._codex_console_command(
-                        "codex", action="resume_id", session_id="019f-test-session"
-                    ),
-                    [
-                        "pwsh.exe",
-                        "-NoExit",
-                        "-Command",
-                        "& 'codex' 'resume' '019f-test-session'",
-                    ],
                 )
 
     def test_fast_visibility_sync_does_not_scan_rollout_files(self):
@@ -372,15 +361,31 @@ class CodexPanelCoreTests(unittest.TestCase):
             updated = json.loads(rollout.read_bytes().splitlines()[0])
             self.assertEqual(provider, "xin gpt5.6sol")
             self.assertEqual(updated["payload"]["model_provider"], "xin gpt5.6sol")
-            self.assertEqual(result, {"db_updated": True, "rollout_updated": True})
+            self.assertEqual(
+                result,
+                {"found": True, "db_updated": True, "rollout_updated": True},
+            )
 
-    def test_resume_picker_does_not_apply_selected_route(self):
+    def test_move_session_changes_route_without_launching_binary(self):
         panel = object.__new__(codex_panel.CodexPanel)
-        panel._launch_binary = mock.Mock()
-        panel.resume_codex()
-        panel._launch_binary.assert_called_once_with(
-            "codex", action="resume", apply_route=False
+        panel.session_id_var = mock.Mock()
+        panel.session_id_var.get.return_value = "019f-test-session"
+        panel.status_var = mock.Mock()
+        panel._selected_route = mock.Mock(
+            return_value={"name": "Xin", "provider_id": "xin"}
         )
+        panel._apply = mock.Mock()
+        panel._launch_binary = mock.Mock()
+        with mock.patch.object(
+            codex_panel,
+            "align_codex_session_provider",
+            return_value={"found": True, "db_updated": True, "rollout_updated": True},
+        ) as align:
+            panel.move_session_to_selected_route()
+
+        align.assert_called_once_with("019f-test-session", "xin")
+        panel._apply.assert_called_once_with({"name": "Xin", "provider_id": "xin"})
+        panel._launch_binary.assert_not_called()
 
     def test_openai_endpoint_builder(self):
         self.assertEqual(

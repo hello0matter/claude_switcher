@@ -669,14 +669,14 @@ def optimize_codex_resume_database():
 
 
 def align_codex_session_provider(session_id, provider_id):
-    """Align one explicitly resumed session with the route being used.
+    """Move one session to a selected provider without launching Codex.
 
     This deliberately touches only the requested session. Older global visibility
     synchronization changed hundreds of unrelated sessions and made route filters
-    misleading; an explicit ID resume is the safe point to repair one stale entry.
+    misleading.
     """
     if not CODEX_DB_FILE.exists():
-        return {"db_updated": False, "rollout_updated": False}
+        return {"found": False, "db_updated": False, "rollout_updated": False}
 
     db = sqlite3.connect(CODEX_DB_FILE, timeout=10)
     try:
@@ -686,7 +686,7 @@ def align_codex_session_provider(session_id, provider_id):
             (session_id,),
         ).fetchone()
         if row is None:
-            return {"db_updated": False, "rollout_updated": False}
+            return {"found": False, "db_updated": False, "rollout_updated": False}
 
         old_provider, rollout_path = row
         rollout_updated = False
@@ -709,7 +709,11 @@ def align_codex_session_provider(session_id, provider_id):
                     "UPDATE threads SET model_provider = ? WHERE id = ?",
                     (provider_id, session_id),
                 )
-        return {"db_updated": db_updated, "rollout_updated": rollout_updated}
+        return {
+            "found": True,
+            "db_updated": db_updated,
+            "rollout_updated": rollout_updated,
+        }
     except sqlite3.Error as exc:
         raise RuntimeError("无法修复该 Session 的 Codex 路线索引") from exc
     finally:
@@ -724,7 +728,7 @@ def _powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _codex_console_command(binary, action="launch", session_id=None):
+def _codex_console_command(binary):
     if binary == "codex":
         executable = os.environ.get("CODEX_COMMAND", "codex")
     elif binary == "codexx":
@@ -733,17 +737,9 @@ def _codex_console_command(binary, action="launch", session_id=None):
         executable = str(CODEXX_EXE)
     else:
         raise ValueError(f"?? Codex ????{binary}")
-    if action == "resume_id":
-        if not session_id:
-            raise ValueError("?? Codex Session ID")
-        arguments = ["resume", session_id]
-    elif action == "resume":
-        arguments = ["resume"]
-    elif action == "launch":
-        arguments = ["--yolo"]
-    else:
-        raise ValueError(f"?? Codex ???{action}")
-    invocation = "& " + " ".join(_powershell_quote(value) for value in [executable, *arguments])
+    invocation = "& " + " ".join(
+        _powershell_quote(value) for value in [executable, "--yolo"]
+    )
     return [_powershell_console(), "-NoExit", "-Command", invocation]
 
 
@@ -1023,15 +1019,11 @@ class CodexPanel(tk.Frame):
             tk.Label(row, textvariable=self.detail_vars[key], anchor="w", justify="left", wraplength=300).pack(side="left", fill="x", expand=True)
         action = tk.Frame(right)
         action.pack(fill="x", pady=(10, 0))
-        tk.Button(action, text="设为 Codex 全局", command=self.apply_global, bg="#13795b", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
+        tk.Button(action, text="仅切换全局路线（不启动）", command=self.apply_global, bg="#13795b", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
         launch_row = tk.Frame(action)
         launch_row.pack(fill="x", pady=(0, 4))
-        tk.Button(launch_row, text="启动 Codex", command=self.launch, bg="#238636", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(side="left", fill="x", expand=True, padx=(0, 2))
-        tk.Button(launch_row, text="启动 Codexx", command=self.launch_codexx, bg="#1f6f9f", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(side="left", fill="x", expand=True, padx=(2, 0))
-        browse_row = tk.Frame(action)
-        browse_row.pack(fill="x", pady=(0, 4))
-        tk.Button(browse_row, text="Codex resume（当前目录）", command=self.resume_codex, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(0, 2))
-        tk.Button(browse_row, text="Codexx resume（当前目录）", command=self.resume_codexx, relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        tk.Button(launch_row, text="用选中路线启动 Codex", command=self.launch, bg="#238636", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        tk.Button(launch_row, text="用选中路线启动 Codexx", command=self.launch_codexx, bg="#1f6f9f", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         session_row = tk.Frame(action)
         session_row.pack(fill="x", pady=(2, 4))
@@ -1039,16 +1031,28 @@ class CodexPanel(tk.Frame):
         tk.Entry(session_row, textvariable=self.session_id_var).pack(side="left", fill="x", expand=True, padx=(0, 4))
         tk.Button(session_row, text="粘贴", command=self.paste_session_id, width=6).pack(side="left")
 
-        restore_row = tk.Frame(action)
-        restore_row.pack(fill="x", pady=(0, 4))
-        tk.Button(restore_row, text="按 ID 恢复 Codex", command=self.resume_codex_id, bg="#238636", fg="white", relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(0, 2))
-        tk.Button(restore_row, text="按 ID 恢复 Codexx", command=self.resume_codexx_id, bg="#1f6f9f", fg="white", relief="flat", pady=4).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        tk.Button(
+            action,
+            text="切换到选中路线并迁移此 Session（不启动）",
+            command=self.move_session_to_selected_route,
+            bg="#2563a6",
+            fg="white",
+            font=("", 10, "bold"),
+            relief="flat",
+            pady=5,
+        ).pack(fill="x", pady=(0, 4))
 
-        tk.Button(action, text="手动优化 resume 数据库", command=self.optimize_resume_database, relief="flat", pady=4).pack(fill="x", pady=(0, 4))
+        tk.Button(action, text="resume 很慢时：压缩索引数据库", command=self.optimize_resume_database, relief="flat", pady=4).pack(fill="x", pady=(0, 2))
+        tk.Label(
+            action,
+            text="平时不用点；只压缩 SQLite 标题/预览索引，不删除 Session 对话。",
+            fg="#777",
+            font=("", 8),
+        ).pack(fill="x", pady=(0, 4))
         tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
         tk.Label(
             action,
-            text="流程：先打开当前目录的 resume，Ctrl+E 展开复制 ID；再选路线，按 ID 直接恢复。不会全局同步，只修正该 Session 的路线索引。",
+            text="迁移流程：选择目标路线，粘贴 ID，点迁移按钮；退出旧 Codex 后，再自行运行 codex resume 或 codexx resume。只修改这一条 Session。",
             fg="#666",
             font=("", 8),
             justify="left",
@@ -1168,12 +1172,6 @@ class CodexPanel(tk.Frame):
     def launch_codexx(self):
         self._launch_binary("codexx")
 
-    def resume_codex(self):
-        self._launch_binary("codex", action="resume", apply_route=False)
-
-    def resume_codexx(self):
-        self._launch_binary("codexx", action="resume", apply_route=False)
-
     def paste_session_id(self):
         try:
             value = self.clipboard_get().strip()
@@ -1182,18 +1180,36 @@ class CodexPanel(tk.Frame):
         if value:
             self.session_id_var.set(value)
 
-    def resume_codex_id(self):
-        self._resume_by_id("codex")
-
-    def resume_codexx_id(self):
-        self._resume_by_id("codexx")
-
-    def _resume_by_id(self, binary):
+    def move_session_to_selected_route(self):
+        route = self._selected_route()
+        if route is None:
+            messagebox.showwarning("提示", "请先选择目标路线", parent=self)
+            return
         session_id = self.session_id_var.get().strip()
         if not session_id:
             messagebox.showwarning("提示", "请先粘贴 Session ID", parent=self)
             return
-        self._launch_binary(binary, action="resume_id", session_id=session_id)
+        try:
+            result = align_codex_session_provider(session_id, route["provider_id"])
+            if not result["found"]:
+                messagebox.showwarning(
+                    "没有找到 Session",
+                    f"数据库中不存在 Session：{session_id}",
+                    parent=self,
+                )
+                return
+            self._apply(route)
+            change_note = (
+                "路线记录已修改"
+                if result["db_updated"] or result["rollout_updated"]
+                else "原本已经属于该路线"
+            )
+            self.status_var.set(
+                f"{change_note}：{session_id} → {route['name']}。未打开窗口；"
+                "请退出旧 Codex 后自行运行 resume。"
+            )
+        except Exception as exc:
+            messagebox.showerror("Session 路线迁移失败", str(exc), parent=self)
 
     def optimize_resume_database(self):
         try:
@@ -1210,31 +1226,18 @@ class CodexPanel(tk.Frame):
         except Exception as exc:
             messagebox.showerror("数据库优化失败", str(exc), parent=self)
 
-    def _launch_binary(self, binary, action="launch", session_id=None, apply_route=True):
-        route = self._selected_route() if apply_route else None
-        if apply_route and route is None:
+    def _launch_binary(self, binary):
+        route = self._selected_route()
+        if route is None:
             messagebox.showwarning("提示", "请先选择一条 Codex 路线", parent=self)
             return
         display_name = "Codexx" if binary == "codexx" else "Codex"
         try:
             if route is not None:
                 self._apply(route)
-            sync_note = ""
-            if session_id and route:
-                sync_result = align_codex_session_provider(
-                    session_id, route["provider_id"]
-                )
-                if sync_result["db_updated"] or sync_result["rollout_updated"]:
-                    sync_note = "（该 Session 索引已对齐当前路线）"
-            command = _codex_console_command(binary, action, session_id)
+            command = _codex_console_command(binary)
             subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_CONSOLE)
-            action_text = {
-                "launch": f"已启动 {display_name}",
-                "resume": f"已打开当前目录的 {display_name} 会话列表",
-                "resume_id": f"按 ID 恢复 {display_name}",
-            }[action]
-            route_note = f"：{route['name']}" if route else ""
-            self.status_var.set(action_text + route_note + sync_note)
+            self.status_var.set(f"已用 {route['name']} 启动 {display_name}")
         except FileNotFoundError as exc:
             detail = str(exc) if str(exc) else f"找不到 {display_name} 二进制文件"
             messagebox.showerror("错误", detail, parent=self)
