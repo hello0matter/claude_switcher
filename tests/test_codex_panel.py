@@ -330,7 +330,17 @@ class CodexPanelCoreTests(unittest.TestCase):
                     "model_provider": "cpa",
                 },
             }, separators=(",", ":")).encode() + b"\n"
-            rollout.write_bytes(first + b'{"type":"event_msg","payload":{}}\n')
+            parent = json.dumps({
+                "type": "session_meta",
+                "payload": {
+                    "id": "019f-parent-session",
+                    "cwd": r"D:\\project",
+                    "source": "cli",
+                    "model_provider": "mc",
+                },
+            }, separators=(",", ":")).encode() + b"\n"
+            event = b'{"type":"event_msg","payload":{"model_provider":"mc"}}\n'
+            rollout.write_bytes(first + parent + event)
             database = root / "state_5.sqlite"
             db = sqlite3.connect(database)
             with db:
@@ -358,9 +368,14 @@ class CodexPanelCoreTests(unittest.TestCase):
                 ("019f-test-session",),
             ).fetchone()[0]
             db.close()
-            updated = json.loads(rollout.read_bytes().splitlines()[0])
+            updated_lines = [
+                json.loads(line) for line in rollout.read_bytes().splitlines()
+            ]
             self.assertEqual(provider, "xin gpt5.6sol")
-            self.assertEqual(updated["payload"]["model_provider"], "xin gpt5.6sol")
+            self.assertEqual(
+                [line["payload"]["model_provider"] for line in updated_lines],
+                ["xin gpt5.6sol", "xin gpt5.6sol", "mc"],
+            )
             self.assertEqual(
                 result,
                 {"found": True, "db_updated": True, "rollout_updated": True},

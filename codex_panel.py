@@ -346,6 +346,75 @@ def _apply_rollout_provider_plan(plan):
         return False
 
 
+def _rewrite_session_meta_providers(path, target_provider):
+    """Update every session_meta provider in one rollout file atomically.
+
+    Forked rollouts can contain both the new fork metadata and copied metadata
+    from their parent session. Codex may use the later copied entry when it
+    reconstructs a resumed session, so changing only the first line can make
+    the status panel show one route while requests still use another route.
+    """
+    initial_stat = path.stat()
+    replacement = json.dumps(target_provider, ensure_ascii=True).encode("ascii")
+    temp_name = None
+    updates = 0
+    try:
+        temp_fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+        with path.open("rb") as source, os.fdopen(temp_fd, "wb") as target:
+            for line in source:
+                if b'"model_provider"' in line and b'"session_meta"' in line:
+                    try:
+                        item = json.loads(line)
+                    except (UnicodeDecodeError, ValueError):
+                        item = None
+                    if isinstance(item, dict) and item.get("type") == "session_meta":
+                        payload = item.get("payload")
+                        if (
+                            isinstance(payload, dict)
+                            and payload.get("model_provider") != target_provider
+                        ):
+                            field_bounds = _find_json_string_field(
+                                line, "model_provider"
+                            )
+                            if field_bounds is None:
+                                raise RuntimeError(
+                                    "Session 历史中的路线字段格式无法识别"
+                                )
+                            value_start, _literal_end, padded_end = field_bounds
+                            line = (
+                                line[:value_start]
+                                + replacement
+                                + line[padded_end:]
+                            )
+                            updates += 1
+                target.write(line)
+            target.flush()
+            os.fsync(target.fileno())
+
+        current_stat = path.stat()
+        if (
+            current_stat.st_size != initial_stat.st_size
+            or current_stat.st_mtime_ns != initial_stat.st_mtime_ns
+        ):
+            raise RuntimeError(
+                "该 Session 仍在运行并写入历史。请先退出旧 Codex，再重新迁移。"
+            )
+        if updates:
+            os.replace(temp_name, path)
+            temp_name = None
+        return bool(updates)
+    except OSError as exc:
+        raise RuntimeError(
+            "无法修改 Session 历史；请先退出正在运行的旧 Codex 后重试"
+        ) from exc
+    finally:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+
 def _table_exists(db, name):
     return db.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -693,14 +762,7 @@ def align_codex_session_provider(session_id, provider_id):
         if rollout_path:
             path = Path(rollout_path)
             if path.is_file():
-                try:
-                    plan = _plan_rollout_provider(path, provider_id)
-                    if isinstance(plan, dict):
-                        rollout_updated = _apply_rollout_provider_plan(plan)
-                except OSError:
-                    # Do not block direct ID resume merely because another Codex
-                    # process temporarily holds the rollout file open.
-                    rollout_updated = False
+                rollout_updated = _rewrite_session_meta_providers(path, provider_id)
 
         db_updated = old_provider != provider_id
         if db_updated:
@@ -892,6 +954,12 @@ class CodexModelTestDialog(tk.Toplevel):
         tk.Button(top, text="应用到路线", command=self._apply).pack(side="left", padx=3)
         self.status = tk.StringVar(value="")
         tk.Label(top, textvariable=self.status, fg="#666").pack(side="right")
+        tk.Label(
+            self,
+            text="这里只测试空白短请求是否联通；旧 Session 还可能被目标站的历史内容审核拦截。",
+            fg="#8a5a00",
+            anchor="w",
+        ).pack(fill="x", padx=13, pady=(0, 6))
         body = tk.Frame(self)
         body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.tree = ttk.Treeview(body, columns=("model", "status", "latency", "error"), show="headings", selectmode="extended")
@@ -1052,7 +1120,7 @@ class CodexPanel(tk.Frame):
         tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
         tk.Label(
             action,
-            text="迁移流程：选择目标路线，粘贴 ID，点迁移按钮；退出旧 Codex 后，再自行运行 codex resume 或 codexx resume。只修改这一条 Session。",
+            text="迁移流程：先退出正在运行的旧 Codex；再选择目标路线、粘贴 ID 并点迁移。之后自行运行 codex resume 或 codexx resume。只修改这一条 Session。",
             fg="#666",
             font=("", 8),
             justify="left",
@@ -1206,7 +1274,8 @@ class CodexPanel(tk.Frame):
             )
             self.status_var.set(
                 f"{change_note}：{session_id} → {route['name']}。未打开窗口；"
-                "请退出旧 Codex 后自行运行 resume。"
+                "现在可以自行运行 resume。若仍提示“高需求”，通常是目标站拒绝旧历史内容，"
+                "并非配置没有切换。"
             )
         except Exception as exc:
             messagebox.showerror("Session 路线迁移失败", str(exc), parent=self)
