@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import shutil
 import sqlite3
 import subprocess
@@ -864,6 +865,7 @@ def _extract_responses_probe_result(body):
     completed_texts = []
     tool_call = False
     errors = []
+    completed = False
     objects = []
     for line in body.splitlines():
         line = line.strip()
@@ -908,6 +910,8 @@ def _extract_responses_probe_result(body):
 
     for item in objects:
         event_type = item.get("type")
+        if event_type == "response.completed":
+            completed = True
         if event_type == "response.output_text.delta" and isinstance(
             item.get("delta"), str
         ):
@@ -923,6 +927,8 @@ def _extract_responses_probe_result(body):
         response = item.get("response")
         if isinstance(response, dict):
             inspect_output(response.get("output"))
+            if response.get("status") == "completed":
+                completed = True
             if response.get("status") == "failed":
                 errors.append(str(response.get("error") or "response.failed"))
         inspect_output(item.get("output"))
@@ -933,7 +939,7 @@ def _extract_responses_probe_result(body):
     else:
         unique_texts = list(dict.fromkeys(completed_texts))
         text = "".join(unique_texts)
-    return text.strip(), tool_call, errors
+    return text.strip(), tool_call, errors, completed
 
 
 def check_codex_route_integrity(route, timeout=45):
@@ -1010,12 +1016,12 @@ def check_codex_route_integrity(route, timeout=45):
         return {
             "verdict": "inconclusive",
             "summary": "检测请求失败，无法判断是否投毒",
-            "details": [str(exc)],
+            "details": [_format_route_probe_error(exc, request_url)],
             "latency_ms": latency,
         }
 
     latency = f"{(time.perf_counter() - started) * 1000:.0f}"
-    output, tool_call, errors = _extract_responses_probe_result(response_body)
+    output, tool_call, errors, completed = _extract_responses_probe_result(response_body)
     details = []
     suspicious = False
     parsed_url = urllib.parse.urlparse(request_url)
@@ -1036,6 +1042,11 @@ def check_codex_route_integrity(route, timeout=45):
     if errors:
         suspicious = True
         details.append("⚠ 响应流包含错误：" + "; ".join(errors)[:500])
+    if completed:
+        details.append("✓ 响应流正常结束")
+    else:
+        suspicious = True
+        details.append("⚠ 响应流没有正常结束，可能被中转站截断或拦截")
     if tool_call:
         suspicious = True
         details.append("⚠ 明确禁止工具时，响应仍触发了工具调用")
@@ -1051,7 +1062,7 @@ def check_codex_route_integrity(route, timeout=45):
     else:
         suspicious = True
         shown = output[:300] if output else "(没有文本输出)"
-        details.append(f"⚠ 返回内容不符合检测指令：{shown}")
+        details.append(f"⚠ 返回内容不符合检测指令，可能被改写、截断或过滤：{shown}")
     if status != 200:
         suspicious = True
         details.append(f"⚠ 返回了非 200 状态：HTTP {status}")
@@ -1065,6 +1076,19 @@ def check_codex_route_integrity(route, timeout=45):
         "details": details,
         "latency_ms": latency,
     }
+
+
+def _format_route_probe_error(exc, request_url):
+    """Turn common transport failures into an actionable diagnostic."""
+    text = str(exc)
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, socket.gaierror) or "getaddrinfo failed" in text:
+        host = urllib.parse.urlparse(request_url).hostname or "该域名"
+        return (
+            f"DNS 解析失败：当前系统无法找到 {host}。这不是投毒结论；"
+            "请检查域名、系统 DNS 或代理（浏览器可能使用了独立 DoH/代理）。"
+        )
+    return text
 
 
 def check_codex_route_anomaly(route, timeout=45):

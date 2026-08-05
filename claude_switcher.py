@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import secrets
+import socket
 import subprocess
 import winreg
 import ctypes
@@ -522,6 +523,7 @@ def _extract_claude_probe_result(body):
     """
     texts = []
     errors = []
+    completed = False
     try:
         parsed = json.loads(body)
     except (TypeError, ValueError):
@@ -542,7 +544,7 @@ def _extract_claude_probe_result(body):
             line.strip().startswith(("data:", "event:"))
             for line in str(body or "").splitlines()
         ):
-            return "".join(texts).strip(), list(dict.fromkeys(errors))
+            return "".join(texts).strip(), list(dict.fromkeys(errors)), True
 
     for raw_line in str(body or "").splitlines():
         line = raw_line.strip()
@@ -558,6 +560,8 @@ def _extract_claude_probe_result(body):
             continue
         if not isinstance(item, dict):
             continue
+        if item.get("type") == "message_stop":
+            completed = True
         if item.get("type") == "error" or item.get("error"):
             error = item.get("error")
             errors.append(str(error or item.get("message") or "API error"))
@@ -566,7 +570,7 @@ def _extract_claude_probe_result(body):
             texts.append(delta["text"])
         if item.get("type") == "content_block" and isinstance(item.get("text"), str):
             texts.append(item["text"])
-    return "".join(texts).strip(), list(dict.fromkeys(errors))
+    return "".join(texts).strip(), list(dict.fromkeys(errors)), completed
 
 
 def check_claude_route_integrity(route, timeout=45):
@@ -641,12 +645,12 @@ def check_claude_route_integrity(route, timeout=45):
         return {
             "verdict": "inconclusive",
             "summary": "检测请求失败，无法判断是否投毒",
-            "details": [str(exc)],
+            "details": [_format_claude_probe_error(exc, request_url)],
             "latency_ms": latency,
         }
 
     latency = f"{(time.perf_counter() - started) * 1000:.0f}"
-    output, errors = _extract_claude_probe_result(response_body)
+    output, errors, completed = _extract_claude_probe_result(response_body)
     details = []
     suspicious = False
     parsed_url = urllib.parse.urlparse(request_url)
@@ -665,6 +669,11 @@ def check_claude_route_integrity(route, timeout=45):
     if errors:
         suspicious = True
         details.append("⚠ 响应流包含错误：" + "; ".join(errors)[:500])
+    if completed:
+        details.append("✓ 响应流正常结束")
+    else:
+        suspicious = True
+        details.append("⚠ 响应流没有正常结束，可能被中转站截断或拦截")
     if private_marker in output:
         suspicious = True
         details.append("⚠ 响应泄露了私有检测标记")
@@ -675,7 +684,7 @@ def check_claude_route_integrity(route, timeout=45):
     else:
         suspicious = True
         shown = output[:300] if output else "(没有文本输出)"
-        details.append(f"⚠ 返回内容不符合检测指令：{shown}")
+        details.append(f"⚠ 返回内容不符合检测指令，可能被改写、截断或过滤：{shown}")
     if status != 200:
         suspicious = True
         details.append(f"⚠ 返回了非 200 状态：HTTP {status}")
@@ -685,6 +694,19 @@ def check_claude_route_integrity(route, timeout=45):
         "details": details,
         "latency_ms": latency,
     }
+
+
+def _format_claude_probe_error(exc, request_url):
+    """Turn common Claude transport failures into an actionable diagnostic."""
+    text = str(exc)
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, socket.gaierror) or "getaddrinfo failed" in text:
+        host = urllib.parse.urlparse(request_url).hostname or "该域名"
+        return (
+            f"DNS 解析失败：当前系统无法找到 {host}。这不是投毒结论；"
+            "请检查域名、系统 DNS 或代理（浏览器可能使用了独立 DoH/代理）。"
+        )
+    return text
 
 
 def check_claude_route_anomaly(route, timeout=45):
