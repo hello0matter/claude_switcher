@@ -1288,7 +1288,7 @@ class CodexPanel(tk.Frame):
         right.pack(side="left", fill="both", expand=True)
         tk.Label(right, text="Codex 详情", font=("", 10, "bold")).pack(anchor="w")
         detail = tk.LabelFrame(right, padx=8, pady=6)
-        detail.pack(fill="both", expand=True)
+        detail.pack(fill="x", expand=False)
         self.detail_vars = {key: tk.StringVar() for key in ("name", "provider_id", "base_url", "api_key", "model", "reasoning_effort", "wire_api", "note")}
         for label, key in (("名称", "name"), ("provider ID", "provider_id"), ("API 地址", "base_url"), ("Bearer 密钥", "api_key"), ("模型", "model"), ("推理强度", "reasoning_effort"), ("wire API", "wire_api"), ("备注", "note")):
             row = tk.Frame(detail)
@@ -1339,14 +1339,6 @@ class CodexPanel(tk.Frame):
             pady=5,
         )
         self.route_integrity_button.pack(fill="x", pady=(0, 4))
-        tk.Label(
-            action,
-            text="迁移流程：先退出正在运行的旧 Codex；再选择目标路线、粘贴 ID 并点迁移。之后自行运行 codex resume 或 codexx resume。只修改这一条 Session。",
-            fg="#666",
-            font=("", 8),
-            justify="left",
-            wraplength=420,
-        ).pack(fill="x", pady=(2, 0))
         self.status_var = tk.StringVar(value="选择 Codex 路线后操作")
         tk.Label(right, textvariable=self.status_var, fg="#777", font=("", 8), wraplength=420, justify="left").pack(anchor="w", pady=(4, 0))
 
