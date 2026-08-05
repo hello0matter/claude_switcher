@@ -98,6 +98,7 @@ class ClaudeSwitcherTests(unittest.TestCase):
         self.assertEqual(payload["model"], "claude-test")
         self.assertIn("PRIVATE_CLAUDE_ROUTE_CANARY_abc123", payload["system"])
         self.assertEqual(request.headers["X-api-key"], "test-key")
+        self.assertEqual(request.headers["User-agent"], "claude-code/route-switcher")
 
     def test_claude_route_anomaly_distinguishes_failed_probe(self):
         with mock.patch.object(

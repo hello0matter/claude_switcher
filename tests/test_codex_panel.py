@@ -107,6 +107,9 @@ class CodexPanelCoreTests(unittest.TestCase):
             result["details"],
         )
         request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.headers["User-agent"], codex_panel.CODEX_PROBE_USER_AGENT
+        )
         payload = json.loads(request.data)
         self.assertNotIn("tool_choice", payload)
         self.assertFalse(payload["parallel_tool_calls"])
@@ -143,6 +146,14 @@ class CodexPanelCoreTests(unittest.TestCase):
         self.assertIn("⚠ 远程中转站使用明文 HTTP", result["details"])
         self.assertIn("⚠ 明确禁止工具时，响应仍触发了工具调用", result["details"])
         self.assertIn("⚠ 响应泄露了私有检测标记", result["details"])
+
+    def test_cloudflare_html_error_is_summarized(self):
+        detail = "<html><title>Access denied | Cloudflare</title></html>"
+        self.assertEqual(
+            codex_panel._format_http_probe_error(403, detail),
+            "HTTP 403：请求已经到达 Cloudflare，但被其访问策略拒绝。"
+            "通常是代理出口 IP 或请求特征被拦截，不是 API Key 或模型错误。",
+        )
 
     def test_manual_route_anomaly_check_classifies_probe_failure(self):
         with mock.patch.object(

@@ -452,6 +452,7 @@ def build_test_headers(route, api_key):
     headers = {
         "content-type": "application/json",
         "anthropic-version": "2023-06-01",
+        "user-agent": "claude-code/route-switcher",
     }
     if route_auth_var(route) == "ANTHROPIC_API_KEY":
         headers["x-api-key"] = api_key

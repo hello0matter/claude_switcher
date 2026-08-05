@@ -50,6 +50,7 @@ VISIBILITY_INSERT_TRIGGER = "codex_resume_visibility_after_insert"
 VISIBILITY_UPDATE_TRIGGER = "codex_resume_visibility_after_update"
 ROLLOUT_PROVIDER_SCAN_LIMIT = 1024 * 1024
 ROLLOUT_REWRITE_BUDGET = 32 * 1024 * 1024
+CODEX_PROBE_USER_AGENT = "codex-cli/route-switcher"
 
 
 @dataclass(frozen=True)
@@ -819,11 +820,28 @@ def _openai_url(base_url, endpoint):
     return base + "/v1/" + endpoint
 
 
+def _format_http_probe_error(status, detail):
+    text = str(detail or "")
+    lowered = text.lower()
+    if status == 403 and ("cloudflare" in lowered or "access denied" in lowered):
+        return (
+            "HTTP 403：请求已经到达 Cloudflare，但被其访问策略拒绝。"
+            "通常是代理出口 IP 或请求特征被拦截，不是 API Key 或模型错误。"
+        )
+    if "<html" in lowered or "<!doctype html" in lowered:
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+    return f"HTTP {status}: {text[:500]}"
+
+
 def test_codex_model(route, model, timeout=30):
     model = (model or route.get("model") or "").strip()
     if not model:
         return False, "", "没有模型名"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": CODEX_PROBE_USER_AGENT,
+    }
     if route.get("api_key"):
         headers["Authorization"] = "Bearer " + route["api_key"]
     wire_api = route.get("wire_api", "responses")
@@ -857,7 +875,11 @@ def test_codex_model(route, model, timeout=30):
         return True, latency, f"HTTP {status}"
     except urllib.error.HTTPError as exc:
         detail = exc.read(500).decode("utf-8", errors="replace")
-        return False, f"{(time.perf_counter() - started) * 1000:.0f}", f"HTTP {exc.code}: {detail}"
+        return (
+            False,
+            f"{(time.perf_counter() - started) * 1000:.0f}",
+            _format_http_probe_error(exc.code, detail),
+        )
     except Exception as exc:
         return False, f"{(time.perf_counter() - started) * 1000:.0f}", str(exc)
 
@@ -986,7 +1008,11 @@ def check_codex_route_integrity(route, timeout=45):
         "stream": True,
         "store": False,
     }
-    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": CODEX_PROBE_USER_AGENT,
+    }
     if route.get("api_key"):
         headers["Authorization"] = "Bearer " + route["api_key"]
     request_url = _openai_url(route.get("base_url"), "responses")
@@ -1010,7 +1036,7 @@ def check_codex_route_integrity(route, timeout=45):
         return {
             "verdict": "inconclusive",
             "summary": "检测请求失败，无法判断是否投毒",
-            "details": [f"HTTP {exc.code}: {detail[:600]}"],
+            "details": [_format_http_probe_error(exc.code, detail)],
             "latency_ms": latency,
         }
     except Exception as exc:
