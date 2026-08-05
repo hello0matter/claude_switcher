@@ -37,6 +37,78 @@ class CodexPanelCoreTests(unittest.TestCase):
         self.assertFalse(payload["store"])
         self.assertNotIn("max_output_tokens", payload)
 
+    def test_manual_route_integrity_check_passes_exact_canary_response(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.geturl.return_value = "https://api.example/v1/responses"
+        response.read.return_value = (
+            b'event: response.output_text.delta\n'
+            b'data: {"type":"response.output_text.delta",'
+            b'"delta":"ROUTE_CHECK_OK_abc123"}\n\n'
+            b'data: {"type":"response.completed","response":'
+            b'{"status":"completed","output":[]}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        context = mock.MagicMock()
+        context.__enter__.return_value = response
+        route = {
+            "base_url": "https://api.example/v1",
+            "api_key": "test-key",
+            "wire_api": "responses",
+            "model": "gpt-test",
+        }
+        with mock.patch.object(
+            codex_panel.secrets, "token_hex", return_value="abc123"
+        ), mock.patch.object(
+            codex_panel.urllib.request, "urlopen", return_value=context
+        ) as urlopen:
+            result = codex_panel.check_codex_route_integrity(route)
+
+        self.assertEqual(result["verdict"], "passed")
+        self.assertEqual(result["summary"], "未发现明显投毒迹象")
+        self.assertIn("✓ 没有被强制插入工具调用", result["details"])
+        self.assertIn(
+            "✓ 随机验证码原样返回，未发现广告或额外文本注入",
+            result["details"],
+        )
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertNotIn("tool_choice", payload)
+        self.assertFalse(payload["parallel_tool_calls"])
+        self.assertEqual(payload["tools"][0]["name"], "route_check_never_call_abc123")
+        self.assertIn("PRIVATE_ROUTE_CANARY_abc123", payload["instructions"])
+
+    def test_manual_route_integrity_check_flags_tool_and_marker_injection(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.geturl.return_value = "https://redirected.example/v1/responses"
+        response.read.return_value = (
+            b'data: {"type":"response.output_item.added","item":'
+            b'{"type":"function_call","name":"unexpected"}}\n\n'
+            b'data: {"type":"response.output_text.delta",'
+            b'"delta":"PRIVATE_ROUTE_CANARY_abc123 injected"}\n\n'
+        )
+        context = mock.MagicMock()
+        context.__enter__.return_value = response
+        with mock.patch.object(
+            codex_panel.secrets, "token_hex", return_value="abc123"
+        ), mock.patch.object(
+            codex_panel.urllib.request, "urlopen", return_value=context
+        ):
+            result = codex_panel.check_codex_route_integrity(
+                {
+                    "base_url": "http://api.example/v1",
+                    "wire_api": "responses",
+                    "model": "gpt-test",
+                }
+            )
+
+        self.assertEqual(result["verdict"], "suspicious")
+        self.assertEqual(result["summary"], "发现可疑行为，请谨慎使用该中转站")
+        self.assertIn("⚠ 远程中转站使用明文 HTTP", result["details"])
+        self.assertIn("⚠ 明确禁止工具时，响应仍触发了工具调用", result["details"])
+        self.assertIn("⚠ 响应泄露了私有检测标记", result["details"])
+
     def test_routes_import_from_existing_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
