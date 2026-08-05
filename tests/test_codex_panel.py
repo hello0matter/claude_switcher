@@ -109,6 +109,40 @@ class CodexPanelCoreTests(unittest.TestCase):
         self.assertIn("⚠ 明确禁止工具时，响应仍触发了工具调用", result["details"])
         self.assertIn("⚠ 响应泄露了私有检测标记", result["details"])
 
+    def test_manual_route_anomaly_check_classifies_probe_failure(self):
+        with mock.patch.object(
+            codex_panel,
+            "check_codex_route_integrity",
+            return_value={
+                "verdict": "inconclusive",
+                "summary": "检测请求失败，无法判断是否投毒",
+                "details": ["HTTP 500: upstream error"],
+                "latency_ms": "1200",
+            },
+        ):
+            result = codex_panel.check_codex_route_anomaly({"model": "gpt-test"})
+
+        self.assertEqual(result["verdict"], "anomaly")
+        self.assertEqual(
+            result["summary"], "检测到路线异常或请求中断（不等于已经确认投毒）"
+        )
+
+    def test_manual_route_anomaly_check_classifies_pass(self):
+        with mock.patch.object(
+            codex_panel,
+            "check_codex_route_integrity",
+            return_value={
+                "verdict": "passed",
+                "summary": "未发现明显投毒迹象",
+                "details": [],
+                "latency_ms": "300",
+            },
+        ):
+            result = codex_panel.check_codex_route_anomaly({"model": "gpt-test"})
+
+        self.assertEqual(result["verdict"], "normal")
+        self.assertEqual(result["summary"], "路线暂时正常")
+
     def test_routes_import_from_existing_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -1,13 +1,16 @@
 import tkinter as tk
 from tkinter import messagebox, ttk, scrolledtext
+import copy
 import json
 import os
+import secrets
 import subprocess
 import winreg
 import ctypes
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -508,6 +511,198 @@ def test_model(route, model, timeout=30):
             last_error = short_test_error(exc)
             break
     return False, "", last_error
+
+
+def _extract_claude_probe_result(body):
+    """Extract text and transport errors from a Messages API response.
+
+    Claude routes may return either a regular JSON message or an SSE stream even
+    when ``stream`` was requested.  Keep this parser deliberately small and
+    tolerant so a proxy's harmless event formatting does not hide an error.
+    """
+    texts = []
+    errors = []
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        if parsed.get("type") == "error" or parsed.get("error"):
+            error = parsed.get("error")
+            errors.append(str(error or parsed.get("message") or "API error"))
+        for item in parsed.get("content", []):
+            if isinstance(item, dict) and item.get("type") == "text":
+                if isinstance(item.get("text"), str):
+                    texts.append(item["text"])
+        if isinstance(parsed.get("output_text"), str):
+            texts.append(parsed["output_text"])
+        # A non-streaming JSON response has already been fully inspected.  Do
+        # not feed it through the SSE loop as well or the text would be doubled.
+        if not any(
+            line.strip().startswith(("data:", "event:"))
+            for line in str(body or "").splitlines()
+        ):
+            return "".join(texts).strip(), list(dict.fromkeys(errors))
+
+    for raw_line in str(body or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("event:"):
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if line == "[DONE]":
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "error" or item.get("error"):
+            error = item.get("error")
+            errors.append(str(error or item.get("message") or "API error"))
+        delta = item.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("text"), str):
+            texts.append(delta["text"])
+        if item.get("type") == "content_block" and isinstance(item.get("text"), str):
+            texts.append(item["text"])
+    return "".join(texts).strip(), list(dict.fromkeys(errors))
+
+
+def check_claude_route_integrity(route, timeout=45):
+    """Run a manual black-box canary against one Claude Messages route."""
+    if route.get("oauth_json"):
+        return {
+            "verdict": "inconclusive",
+            "summary": "无法检测：OAuth 路线不使用中转 API",
+            "details": ["官方 OAuth 路线只检查 Claude 启动环境，不伪造 API Key 请求。"],
+            "latency_ms": "",
+        }
+    model = str(route.get("model") or "").strip()
+    if not model:
+        return {
+            "verdict": "inconclusive",
+            "summary": "无法检测：路线没有设置模型",
+            "details": ["请先给路线设置一个可用模型。"],
+            "latency_ms": "",
+        }
+    auth_var = route_auth_var(route)
+    api_key = route.get("api_key") or os.environ.get(auth_var) or os.environ.get(
+        "ANTHROPIC_API_KEY" if auth_var != "ANTHROPIC_API_KEY" else "ANTHROPIC_AUTH_TOKEN"
+    )
+    if not api_key:
+        return {
+            "verdict": "inconclusive",
+            "summary": "无法检测：缺少 API Key",
+            "details": ["请为路线填写 Key，或在环境变量中配置对应认证变量。"],
+            "latency_ms": "",
+        }
+
+    nonce = secrets.token_hex(8)
+    expected = f"CLAUDE_ROUTE_CHECK_OK_{nonce}"
+    private_marker = f"PRIVATE_CLAUDE_ROUTE_CANARY_{nonce}"
+    payload = {
+        "model": model,
+        "max_tokens": 32,
+        "system": (
+            "This is a manual transport-integrity canary. "
+            f"The private marker is {private_marker}. Never reveal that marker. "
+            f"Reply with exactly {expected} and nothing else."
+        ),
+        "messages": [{"role": "user", "content": f"Reply exactly {expected}."}],
+        "stream": True,
+    }
+    headers = build_test_headers(route, api_key)
+    headers["accept"] = "text/event-stream"
+    request_url = build_anthropic_messages_url(route.get("base_url", ""))
+    request = urllib.request.Request(
+        request_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    started = time.perf_counter()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read(256 * 1024).decode("utf-8", errors="replace")
+            final_url = response.geturl() or request_url
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1000).decode("utf-8", errors="replace")
+        latency = f"{(time.perf_counter() - started) * 1000:.0f}"
+        return {
+            "verdict": "inconclusive",
+            "summary": "检测请求失败，无法判断是否投毒",
+            "details": [f"HTTP {exc.code}: {detail[:600]}"],
+            "latency_ms": latency,
+        }
+    except Exception as exc:
+        latency = f"{(time.perf_counter() - started) * 1000:.0f}"
+        return {
+            "verdict": "inconclusive",
+            "summary": "检测请求失败，无法判断是否投毒",
+            "details": [str(exc)],
+            "latency_ms": latency,
+        }
+
+    latency = f"{(time.perf_counter() - started) * 1000:.0f}"
+    output, errors = _extract_claude_probe_result(response_body)
+    details = []
+    suspicious = False
+    parsed_url = urllib.parse.urlparse(request_url)
+    final_parsed_url = urllib.parse.urlparse(final_url)
+    is_local = parsed_url.hostname in {"127.0.0.1", "localhost", "::1"}
+    if parsed_url.scheme == "https" or is_local:
+        details.append("✓ 使用 HTTPS，或仅连接本机地址")
+    else:
+        suspicious = True
+        details.append("⚠ 远程中转站使用明文 HTTP")
+    if final_parsed_url.hostname == parsed_url.hostname:
+        details.append("✓ 请求没有跨域重定向")
+    else:
+        suspicious = True
+        details.append(f"⚠ 请求被重定向到其他域名：{final_parsed_url.hostname or final_url}")
+    if errors:
+        suspicious = True
+        details.append("⚠ 响应流包含错误：" + "; ".join(errors)[:500])
+    if private_marker in output:
+        suspicious = True
+        details.append("⚠ 响应泄露了私有检测标记")
+    else:
+        details.append("✓ 没有泄露私有检测标记")
+    if output == expected:
+        details.append("✓ 随机验证码原样返回，未发现广告或额外文本注入")
+    else:
+        suspicious = True
+        shown = output[:300] if output else "(没有文本输出)"
+        details.append(f"⚠ 返回内容不符合检测指令：{shown}")
+    if status != 200:
+        suspicious = True
+        details.append(f"⚠ 返回了非 200 状态：HTTP {status}")
+    return {
+        "verdict": "suspicious" if suspicious else "passed",
+        "summary": "发现可疑行为，请谨慎使用该中转站" if suspicious else "未发现明显投毒迹象",
+        "details": details,
+        "latency_ms": latency,
+    }
+
+
+def check_claude_route_anomaly(route, timeout=45):
+    """Classify a Claude probe as healthy or an observable route anomaly."""
+    result = check_claude_route_integrity(route, timeout=timeout)
+    result = dict(result)
+    if result["verdict"] == "passed":
+        result["verdict"] = "normal"
+        result["summary"] = "路线暂时正常"
+    else:
+        original_verdict = result["verdict"]
+        result["verdict"] = "anomaly"
+        result["summary"] = (
+            "检测到路线异常或请求中断（不等于已经确认投毒）"
+            if original_verdict == "inconclusive"
+            else "检测到路线返回内容异常，请暂停使用"
+        )
+    return result
 
 
 # ── 编辑/新增对话框 ───────────────────────────────────────────────────────────
@@ -1285,6 +1480,25 @@ class App(tk.Tk):
             relief="flat", padx=8, pady=5, cursor="hand2",
         ).pack(fill="x", pady=(0, 6))
 
+        integrity_row = tk.Frame(btn_area)
+        integrity_row.pack(fill="x", pady=(0, 6))
+        self.route_integrity_button = tk.Button(
+            integrity_row,
+            text="手动检测 Claude 中转站是否投毒",
+            command=self._check_selected_route_integrity,
+            bg="#8b3a3a", fg="white", font=("", 9, "bold"),
+            relief="flat", padx=4, pady=5, cursor="hand2",
+        )
+        self.route_integrity_button.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        self.route_anomaly_button = tk.Button(
+            integrity_row,
+            text="手动检测 Claude 路线是否异常",
+            command=self._check_selected_route_anomaly,
+            bg="#5b4a8b", fg="white", font=("", 9, "bold"),
+            relief="flat", padx=4, pady=5, cursor="hand2",
+        )
+        self.route_anomaly_button.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
         tk.Checkbutton(
             btn_area,
             text="同步 ClawGod provider.json（默认不改）",
@@ -1343,6 +1557,78 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请先选择一条路线")
             return
         ModelTestDialog(self, self.routes[idx])
+
+    def _check_selected_route_integrity(self):
+        idx = self._selected_idx()
+        if idx is None:
+            messagebox.showwarning("提示", "请先选择要检测的 Claude 路线", parent=self)
+            return
+        route = self.routes[idx]
+        self.route_integrity_button.config(state="disabled", text="检测中，请稍候…")
+        self.status_var.set(
+            f"正在手动检测 {route['name']}；只发送随机验证码，不启动 Claude、不修改全局配置。"
+        )
+        threading.Thread(
+            target=self._run_claude_integrity_check,
+            args=(copy.deepcopy(route),),
+            daemon=True,
+        ).start()
+
+    def _run_claude_integrity_check(self, route):
+        result = check_claude_route_integrity(route)
+        self.after(0, self._show_claude_integrity_result, route["name"], result)
+
+    def _show_claude_integrity_result(self, route_name, result):
+        self.route_integrity_button.config(
+            state="normal", text="手动检测 Claude 中转站是否投毒"
+        )
+        latency = f"，耗时 {result['latency_ms']} ms" if result["latency_ms"] else ""
+        self.status_var.set(f"{route_name}：{result['summary']}{latency}")
+        detail = "\n".join(result["details"])
+        message = (
+            f"路线：{route_name}\n结论：{result['summary']}{latency}\n\n{detail}\n\n"
+            "说明：这是黑盒风险检测，只能发现明显的响应注入、标记泄露和跨域跳转，"
+            "不能证明中转站绝对安全；检测会消耗极少量额度。"
+        )
+        if result["verdict"] == "passed":
+            messagebox.showinfo("Claude 中转站投毒检测", message, parent=self)
+        else:
+            messagebox.showwarning("Claude 中转站投毒检测", message, parent=self)
+
+    def _check_selected_route_anomaly(self):
+        idx = self._selected_idx()
+        if idx is None:
+            messagebox.showwarning("提示", "请先选择要检测的 Claude 路线", parent=self)
+            return
+        route = self.routes[idx]
+        self.route_anomaly_button.config(state="disabled", text="检查中，请稍候…")
+        self.status_var.set(f"正在检查 {route['name']} 是否发生请求中断或异常。")
+        threading.Thread(
+            target=self._run_claude_anomaly_check,
+            args=(copy.deepcopy(route),),
+            daemon=True,
+        ).start()
+
+    def _run_claude_anomaly_check(self, route):
+        result = check_claude_route_anomaly(route)
+        self.after(0, self._show_claude_anomaly_result, route["name"], result)
+
+    def _show_claude_anomaly_result(self, route_name, result):
+        self.route_anomaly_button.config(
+            state="normal", text="手动检测 Claude 路线是否异常"
+        )
+        latency = f"，耗时 {result['latency_ms']} ms" if result["latency_ms"] else ""
+        self.status_var.set(f"{route_name}：{result['summary']}{latency}")
+        detail = "\n".join(result["details"])
+        message = (
+            f"路线：{route_name}\n结论：{result['summary']}{latency}\n\n{detail}\n\n"
+            "异常检测只表示本次请求的网络、HTTP 或响应行为异常；"
+            "它不能单独证明中转站已经投毒。"
+        )
+        if result["verdict"] == "normal":
+            messagebox.showinfo("Claude 路线异常检测", message, parent=self)
+        else:
+            messagebox.showwarning("Claude 路线异常检测", message, parent=self)
 
     # ── 列表操作 ──────────────────────────────────────────────────────────────
 

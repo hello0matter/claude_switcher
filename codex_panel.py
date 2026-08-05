@@ -1067,6 +1067,25 @@ def check_codex_route_integrity(route, timeout=45):
     }
 
 
+def check_codex_route_anomaly(route, timeout=45):
+    """Classify one manual probe as healthy or an observable route anomaly."""
+    result = check_codex_route_integrity(route, timeout=timeout)
+    if result["verdict"] == "passed":
+        result = dict(result)
+        result["verdict"] = "normal"
+        result["summary"] = "路线暂时正常"
+    else:
+        original_verdict = result["verdict"]
+        result = dict(result)
+        result["verdict"] = "anomaly"
+        result["summary"] = (
+            "检测到路线异常或请求中断（不等于已经确认投毒）"
+            if original_verdict == "inconclusive"
+            else "检测到路线返回内容异常，请暂停使用"
+        )
+    return result
+
+
 class CodexRouteEditor(tk.Toplevel):
     def __init__(self, parent, route=None, title="添加 Codex 路线"):
         super().__init__(parent)
@@ -1328,8 +1347,10 @@ class CodexPanel(tk.Frame):
             font=("", 8),
         ).pack(fill="x", pady=(0, 4))
         tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
+        integrity_row = tk.Frame(action)
+        integrity_row.pack(fill="x", pady=(0, 4))
         self.route_integrity_button = tk.Button(
-            action,
+            integrity_row,
             text="手动检测中转站是否投毒",
             command=self.check_selected_route_integrity,
             bg="#8b3a3a",
@@ -1338,7 +1359,18 @@ class CodexPanel(tk.Frame):
             relief="flat",
             pady=5,
         )
-        self.route_integrity_button.pack(fill="x", pady=(0, 4))
+        self.route_integrity_button.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        self.route_anomaly_button = tk.Button(
+            integrity_row,
+            text="手动检测路线是否异常",
+            command=self.check_selected_route_anomaly,
+            bg="#5b4a8b",
+            fg="white",
+            font=("", 10, "bold"),
+            relief="flat",
+            pady=5,
+        )
+        self.route_anomaly_button.pack(side="left", fill="x", expand=True, padx=(2, 0))
         self.status_var = tk.StringVar(value="选择 Codex 路线后操作")
         tk.Label(right, textvariable=self.status_var, fg="#777", font=("", 8), wraplength=420, justify="left").pack(anchor="w", pady=(4, 0))
 
@@ -1568,3 +1600,37 @@ class CodexPanel(tk.Frame):
             messagebox.showinfo("中转站投毒检测", message, parent=self)
         else:
             messagebox.showwarning("中转站投毒检测", message, parent=self)
+
+    def check_selected_route_anomaly(self):
+        route = self._selected_route()
+        if route is None:
+            messagebox.showwarning("提示", "请先选择要检测的 Codex 路线", parent=self)
+            return
+        self.route_anomaly_button.config(state="disabled", text="正在检查路线，请稍候…")
+        self.status_var.set(f"正在检查 {route['name']} 是否发生请求中断或异常。")
+        threading.Thread(
+            target=self._run_route_anomaly_check,
+            args=(copy.deepcopy(route),),
+            daemon=True,
+        ).start()
+
+    def _run_route_anomaly_check(self, route):
+        result = check_codex_route_anomaly(route)
+        self.after(0, self._show_route_anomaly_result, route["name"], result)
+
+    def _show_route_anomaly_result(self, route_name, result):
+        self.route_anomaly_button.config(
+            state="normal", text="手动检测路线是否异常"
+        )
+        latency = f"，耗时 {result['latency_ms']} ms" if result["latency_ms"] else ""
+        self.status_var.set(f"{route_name}：{result['summary']}{latency}")
+        detail = "\n".join(result["details"])
+        message = (
+            f"路线：{route_name}\n结论：{result['summary']}{latency}\n\n{detail}\n\n"
+            "异常检测只表示本次请求的网络、HTTP 或响应行为异常；"
+            "它不能单独证明中转站已经投毒。"
+        )
+        if result["verdict"] == "normal":
+            messagebox.showinfo("Codex 路线异常检测", message, parent=self)
+        else:
+            messagebox.showwarning("Codex 路线异常检测", message, parent=self)
