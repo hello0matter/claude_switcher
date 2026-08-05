@@ -16,6 +16,7 @@ import urllib.request
 import uuid
 
 from codex_panel import CodexPanel
+from cost_comparison import CostComparisonDialog
 
 CONFIG_FILE   = os.path.expanduser("~/.cc_routes.json")
 SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
@@ -1433,14 +1434,18 @@ class App(tk.Tk):
         left = tk.Frame(body)
         left.pack(side="left", fill="both", expand=True, padx=(0, 6))
 
-        tk.Label(left, text="路线列表", font=("", 10, "bold")).pack(anchor="w")
+        tk.Label(
+            left,
+            text="路线列表（Ctrl 多选，Shift 连选）",
+            font=("", 10, "bold"),
+        ).pack(anchor="w")
 
         list_frame = tk.Frame(left)
         list_frame.pack(fill="both", expand=True)
 
         sb = tk.Scrollbar(list_frame, orient="vertical")
         self.listbox = tk.Listbox(
-            list_frame, selectmode="single", font=("Consolas", 10),
+            list_frame, selectmode="extended", exportselection=False, font=("Consolas", 10),
             yscrollcommand=sb.set, activestyle="dotbox",
         )
         sb.config(command=self.listbox.yview)
@@ -1495,12 +1500,26 @@ class App(tk.Tk):
             relief="flat", padx=8, pady=5, cursor="hand2",
         ).pack(fill="x", pady=(0, 4))
 
+        compare_row = tk.Frame(btn_area)
+        compare_row.pack(fill="x", pady=(0, 6))
         tk.Button(
-            btn_area, text="🧪  模型测试表格",
+            compare_row, text="🧪  模型测试表格",
             command=self._open_model_tests,
             bg="#EF6C00", fg="white", font=("", 10, "bold"),
             relief="flat", padx=8, pady=5, cursor="hand2",
-        ).pack(fill="x", pady=(0, 6))
+        ).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        tk.Button(
+            compare_row,
+            text="💰  多选路线资费对比",
+            command=self._open_cost_comparison,
+            bg="#1565C0",
+            fg="white",
+            font=("", 10, "bold"),
+            relief="flat",
+            padx=8,
+            pady=5,
+            cursor="hand2",
+        ).pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         integrity_row = tk.Frame(btn_area)
         integrity_row.pack(fill="x", pady=(0, 6))
@@ -1562,6 +1581,7 @@ class App(tk.Tk):
         if self.sync_clawgod_var.get():
             sync_clawgod_warlord(r)
         self._refresh_global_status()
+        self._refresh_list(idx)
         extra = "，ClawGod 已同步" if self.sync_clawgod_var.get() else ""
         self.status_var.set(
             f"已设为全局：{r['name']}（注册表 + settings.json 已更新{extra}；"
@@ -1571,6 +1591,7 @@ class App(tk.Tk):
     def _clear_global(self):
         clear_global()
         self._refresh_global_status()
+        self._refresh_list(self._selected_idx())
         self.status_var.set("已清除全局代理，恢复官方")
 
     def _open_model_tests(self):
@@ -1579,6 +1600,31 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请先选择一条路线")
             return
         ModelTestDialog(self, self.routes[idx])
+
+    def _open_cost_comparison(self):
+        indexes = self._selected_indices()
+        if len(indexes) < 2:
+            messagebox.showwarning(
+                "请选择至少两条路线",
+                "按住 Ctrl 逐个多选，或按住 Shift 连续多选，然后再点击资费对比。",
+                parent=self,
+            )
+            return
+        active_index = self._active_route_index()
+        items = []
+        for index in indexes:
+            route = self.routes[index]
+            items.append(
+                {
+                    "kind": "claude",
+                    "route_id": ensure_route_table_id(route),
+                    "name": route.get("name", "未命名"),
+                    "model": route.get("model", ""),
+                    "base_url": route.get("base_url", ""),
+                    "locked": index == active_index,
+                }
+            )
+        CostComparisonDialog(self, items)
 
     def _check_selected_route_integrity(self):
         idx = self._selected_idx()
@@ -1656,11 +1702,14 @@ class App(tk.Tk):
 
     def _refresh_list(self, select_idx=None):
         self.listbox.delete(0, "end")
-        for r in self.routes:
-            label = r["name"]
+        active_index = self._active_route_index()
+        for index, r in enumerate(self.routes):
+            label = ("🔒 " if index == active_index else "") + r["name"]
             if r.get("model"):
                 label += f"  [{r['model']}]"
             self.listbox.insert("end", label)
+            if index == active_index:
+                self.listbox.itemconfig(index, fg="#1565C0")
         if select_idx is not None and self.routes:
             idx = max(0, min(select_idx, len(self.routes) - 1))
             self.listbox.selection_set(idx)
@@ -1669,7 +1718,34 @@ class App(tk.Tk):
 
     def _selected_idx(self):
         sel = self.listbox.curselection()
-        return sel[0] if sel else None
+        if not sel:
+            return None
+        active = self.listbox.index("active")
+        return active if active in sel else sel[0]
+
+    def _selected_indices(self):
+        return list(self.listbox.curselection())
+
+    def _active_route_index(self):
+        settings = load_settings()
+        env = settings.get("env", {})
+        active_base_url = str(
+            env.get("ANTHROPIC_BASE_URL") or get_global_route() or ""
+        ).rstrip("/")
+        active_model = str(
+            settings.get("model") or _get_user_env("ANTHROPIC_MODEL") or ""
+        )
+        active_oauth = os.path.exists(OAUTH_FILE)
+        for index, route in enumerate(self.routes):
+            route_base_url = str(route.get("base_url") or "").rstrip("/")
+            route_oauth = bool(str(route.get("oauth_json") or "").strip())
+            if route_oauth != active_oauth or route_base_url != active_base_url:
+                continue
+            route_model = str(route.get("model") or "")
+            if active_model and route_model and route_model != active_model:
+                continue
+            return index
+        return None
 
     def _on_select(self, event=None):
         idx = self._selected_idx()
@@ -1761,6 +1837,7 @@ class App(tk.Tk):
         if self.sync_clawgod_var.get():
             sync_clawgod_warlord(r)
         self._refresh_global_status()
+        self._refresh_list(idx)
         env = os.environ.copy()
         if r.get("oauth_json"):
             env.pop("ANTHROPIC_BASE_URL", None)  # 独立启动时，Pro号同样强行踢掉BaseURL

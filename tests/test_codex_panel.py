@@ -9,6 +9,41 @@ import codex_panel
 
 
 class CodexPanelCoreTests(unittest.TestCase):
+    def test_active_route_uses_provider_endpoint_and_name_not_provider_id_alone(self):
+        panel = object.__new__(codex_panel.CodexPanel)
+        panel.routes = [
+            codex_panel._normalise_route(
+                {
+                    "name": "xin",
+                    "provider_id": "mc",
+                    "base_url": "https://xin.example/v1",
+                    "model": "gpt-test",
+                }
+            ),
+            codex_panel._normalise_route(
+                {
+                    "name": "ai777",
+                    "provider_id": "mc",
+                    "base_url": "https://ai777.example/v1",
+                    "model": "gpt-test",
+                }
+            ),
+        ]
+        config = {
+            "model_provider": "mc",
+            "model": "gpt-test",
+            "model_providers": {
+                "mc": {
+                    "name": "ai777",
+                    "base_url": "https://ai777.example/v1",
+                }
+            },
+        }
+        with mock.patch.object(codex_panel, "_read_codex_config", return_value=config):
+            active = panel._active_route_index()
+
+        self.assertEqual(active, 1)
+
     def test_default_codexx_path_uses_sandbox_binary(self):
         expected = Path.home() / ".codex" / ".sandbox-bin" / "codexx.exe"
         self.assertEqual(codex_panel.CODEXX_EXE, expected)
@@ -358,12 +393,16 @@ class CodexPanelCoreTests(unittest.TestCase):
             "provider_id": "fast",
             "wire_api": "responses",
         })
+        panel.routes = [route]
+        panel.selected_index = mock.Mock(return_value=0)
+        panel.refresh_list = mock.Mock()
         with mock.patch.object(codex_panel, "_write_codex_config", return_value=None), mock.patch.object(
             codex_panel, "sync_codex_session_visibility"
         ) as sync_visibility:
             panel._apply(route)
         sync_visibility.assert_not_called()
         panel.refresh_status.assert_called_once_with()
+        panel.refresh_list.assert_called_once_with(0)
         panel.status_var.set.assert_called_once_with("已应用：Fast route")
 
     def test_resume_database_optimizer_removes_old_sync_and_compacts_metadata(self):

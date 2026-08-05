@@ -6,6 +6,34 @@ import claude_switcher
 
 
 class ClaudeSwitcherTests(unittest.TestCase):
+    def test_active_claude_route_uses_endpoint_and_model(self):
+        app = object.__new__(claude_switcher.App)
+        app.routes = [
+            {
+                "name": "route-a",
+                "base_url": "https://a.example/v1",
+                "model": "claude-a",
+            },
+            {
+                "name": "route-b",
+                "base_url": "https://b.example/v1",
+                "model": "claude-b",
+            },
+        ]
+        with mock.patch.object(
+            claude_switcher,
+            "load_settings",
+            return_value={
+                "model": "claude-b",
+                "env": {"ANTHROPIC_BASE_URL": "https://b.example/v1"},
+            },
+        ), mock.patch.object(
+            claude_switcher.os.path, "exists", return_value=False
+        ):
+            active = app._active_route_index()
+
+        self.assertEqual(active, 1)
+
     def test_set_global_has_no_clipboard_side_effect(self):
         app = object.__new__(claude_switcher.App)
         app.routes = [{"name": "测试路线"}]
@@ -13,6 +41,7 @@ class ClaudeSwitcherTests(unittest.TestCase):
         app.sync_clawgod_var = mock.Mock()
         app.sync_clawgod_var.get.return_value = False
         app._refresh_global_status = mock.Mock()
+        app._refresh_list = mock.Mock()
         app.status_var = mock.Mock()
         app.clipboard_clear = mock.Mock()
         app.clipboard_append = mock.Mock()
@@ -28,6 +57,7 @@ class ClaudeSwitcherTests(unittest.TestCase):
         sync_oauth.assert_called_once_with(app.routes[0])
         sync_clawgod.assert_not_called()
         app._refresh_global_status.assert_called_once_with()
+        app._refresh_list.assert_called_once_with(0)
         app.clipboard_clear.assert_not_called()
         app.clipboard_append.assert_not_called()
         app.status_var.set.assert_called_once_with(

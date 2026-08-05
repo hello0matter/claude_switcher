@@ -25,6 +25,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
+from cost_comparison import CostComparisonDialog
+
 try:
     import tomlkit
 except ImportError:  # pragma: no cover - only used on machines missing the optional writer
@@ -1312,11 +1314,22 @@ class CodexPanel(tk.Frame):
         body.pack(fill="both", expand=True, padx=10, pady=8)
         left = tk.Frame(body)
         left.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        tk.Label(left, text="Codex 路线", font=("", 10, "bold")).pack(anchor="w")
+        tk.Label(
+            left,
+            text="Codex 路线（Ctrl 多选，Shift 连选）",
+            font=("", 10, "bold"),
+        ).pack(anchor="w")
         list_frame = tk.Frame(left)
         list_frame.pack(fill="both", expand=True)
         scroll = tk.Scrollbar(list_frame, orient="vertical")
-        self.listbox = tk.Listbox(list_frame, font=("Consolas", 10), yscrollcommand=scroll.set, activestyle="dotbox")
+        self.listbox = tk.Listbox(
+            list_frame,
+            selectmode="extended",
+            exportselection=False,
+            font=("Consolas", 10),
+            yscrollcommand=scroll.set,
+            activestyle="dotbox",
+        )
         scroll.config(command=self.listbox.yview)
         scroll.pack(side="right", fill="y")
         self.listbox.pack(fill="both", expand=True)
@@ -1370,7 +1383,28 @@ class CodexPanel(tk.Frame):
             fg="#777",
             font=("", 8),
         ).pack(fill="x", pady=(0, 4))
-        tk.Button(action, text="Codex 模型测试表", command=self.open_model_tests, bg="#b35c00", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
+        compare_row = tk.Frame(action)
+        compare_row.pack(fill="x", pady=(0, 4))
+        tk.Button(
+            compare_row,
+            text="Codex 模型测试表",
+            command=self.open_model_tests,
+            bg="#b35c00",
+            fg="white",
+            font=("", 10, "bold"),
+            relief="flat",
+            pady=5,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        tk.Button(
+            compare_row,
+            text="多选路线资费对比",
+            command=self.open_cost_comparison,
+            bg="#1565C0",
+            fg="white",
+            font=("", 10, "bold"),
+            relief="flat",
+            pady=5,
+        ).pack(side="left", fill="x", expand=True, padx=(2, 0))
         integrity_row = tk.Frame(action)
         integrity_row.pack(fill="x", pady=(0, 4))
         self.route_integrity_button = tk.Button(
@@ -1400,15 +1434,46 @@ class CodexPanel(tk.Frame):
 
     def selected_index(self):
         selected = self.listbox.curselection()
-        return selected[0] if selected else None
+        if not selected:
+            return None
+        active = self.listbox.index("active")
+        return active if active in selected else selected[0]
+
+    def selected_indices(self):
+        return list(self.listbox.curselection())
+
+    def _active_route_index(self):
+        config = _read_codex_config()
+        provider_id = str(config.get("model_provider") or "")
+        model = str(config.get("model") or "")
+        provider = (config.get("model_providers") or {}).get(provider_id, {})
+        provider = provider if isinstance(provider, dict) else {}
+        base_url = str(provider.get("base_url") or "").rstrip("/")
+        provider_name = str(provider.get("name") or "")
+        candidates = []
+        for index, route in enumerate(self.routes):
+            if route.get("provider_id") != provider_id:
+                continue
+            if str(route.get("base_url") or "").rstrip("/") != base_url:
+                continue
+            route_model = str(route.get("model") or "")
+            if model and route_model and route_model != model:
+                continue
+            candidates.append(index)
+            if provider_name and route.get("name") == provider_name:
+                return index
+        return candidates[0] if candidates else None
 
     def refresh_list(self, select_index=None):
         self.listbox.delete(0, "end")
-        for route in self.routes:
-            label = route["name"]
+        active_index = self._active_route_index()
+        for index, route in enumerate(self.routes):
+            label = ("🔒 " if index == active_index else "") + route["name"]
             if route.get("model"):
                 label += "  [" + route["model"] + "]"
             self.listbox.insert("end", label)
+            if index == active_index:
+                self.listbox.itemconfig(index, fg="#1565C0")
         if select_index is not None and self.routes:
             index = max(0, min(select_index, len(self.routes) - 1))
             self.listbox.selection_set(index)
@@ -1426,7 +1491,14 @@ class CodexPanel(tk.Frame):
 
     def refresh_status(self):
         config = _read_codex_config()
-        self.current_label.config(text=config.get("model_provider") or "(未设置)")
+        provider_id = str(config.get("model_provider") or "")
+        active_index = self._active_route_index()
+        if active_index is not None:
+            route_name = self.routes[active_index].get("name", "未命名")
+            current_text = f"🔒 {route_name}（{provider_id}）"
+        else:
+            current_text = provider_id or "(未设置)"
+        self.current_label.config(text=current_text)
         self.model_label.config(text="model: " + str(config.get("model") or "(未设置)"))
 
     def add(self):
@@ -1490,6 +1562,16 @@ class CodexPanel(tk.Frame):
     def _apply(self, route):
         backup = _write_codex_config(route)
         self.refresh_status()
+        route_id = route.get("route_id")
+        index = next(
+            (
+                route_index
+                for route_index, candidate in enumerate(self.routes)
+                if candidate.get("route_id") == route_id
+            ),
+            self.selected_index(),
+        )
+        self.refresh_list(index)
         backup_note = "，已备份 config.toml" if backup else ""
         self.status_var.set(f"已应用：{route['name']}{backup_note}")
 
@@ -1588,6 +1670,31 @@ class CodexPanel(tk.Frame):
             messagebox.showwarning("提示", "请先选择一条 Codex 路线", parent=self)
             return
         CodexModelTestDialog(self, route)
+
+    def open_cost_comparison(self):
+        indexes = self.selected_indices()
+        if len(indexes) < 2:
+            messagebox.showwarning(
+                "请选择至少两条路线",
+                "按住 Ctrl 逐个多选，或按住 Shift 连续多选，然后再点击资费对比。",
+                parent=self,
+            )
+            return
+        active_index = self._active_route_index()
+        items = []
+        for index in indexes:
+            route = self.routes[index]
+            items.append(
+                {
+                    "kind": "codex",
+                    "route_id": route.get("route_id"),
+                    "name": route.get("name", "未命名"),
+                    "model": route.get("model", ""),
+                    "base_url": route.get("base_url", ""),
+                    "locked": index == active_index,
+                }
+            )
+        CostComparisonDialog(self, items)
 
     def check_selected_route_integrity(self):
         route = self._selected_route()
