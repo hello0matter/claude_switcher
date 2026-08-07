@@ -25,6 +25,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
+from app_network import describe_network_error, open_app_request
 from cost_comparison import CostComparisonDialog
 
 try:
@@ -866,7 +867,7 @@ def test_codex_model(route, model, timeout=30):
     request = urllib.request.Request(_openai_url(route.get("base_url"), endpoint), data=body, headers=headers, method="POST")
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_app_request(request, timeout=timeout) as response:
             body = response.read(8192).decode("utf-8", errors="replace")
             status = response.status
         latency = f"{(time.perf_counter() - started) * 1000:.0f}"
@@ -881,7 +882,11 @@ def test_codex_model(route, model, timeout=30):
             _format_http_probe_error(exc.code, detail),
         )
     except Exception as exc:
-        return False, f"{(time.perf_counter() - started) * 1000:.0f}", str(exc)
+        return (
+            False,
+            f"{(time.perf_counter() - started) * 1000:.0f}",
+            describe_network_error(exc),
+        )
 
 
 def _extract_responses_probe_result(body):
@@ -1024,7 +1029,7 @@ def check_codex_route_integrity(route, timeout=45):
     )
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_app_request(request, timeout=timeout) as response:
             response_body = response.read(256 * 1024).decode(
                 "utf-8", errors="replace"
             )
@@ -1109,6 +1114,9 @@ def check_codex_route_integrity(route, timeout=45):
 def _format_route_probe_error(exc, request_url):
     """Turn common transport failures into an actionable diagnostic."""
     text = str(exc)
+    described = describe_network_error(exc)
+    if described != text:
+        return described
     reason = getattr(exc, "reason", None)
     if isinstance(reason, socket.gaierror) or "getaddrinfo failed" in text:
         host = urllib.parse.urlparse(request_url).hostname or "该域名"

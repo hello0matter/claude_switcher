@@ -16,7 +16,14 @@ import urllib.request
 import uuid
 
 from codex_panel import CodexPanel
+from app_network import (
+    NetworkSettingsDialog,
+    describe_network_error,
+    network_config_display,
+    open_app_request,
+)
 from cost_comparison import CostComparisonDialog
+from help_dialog import HelpDialog
 
 CONFIG_FILE   = os.path.expanduser("~/.cc_routes.json")
 SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
@@ -477,7 +484,7 @@ def short_test_error(exc, body=""):
         return f"HTTP {exc.code} {hint}: {body[:300]}"
     if isinstance(exc, TimeoutError):
         return "请求超时：模型慢或中转站无响应"
-    return str(exc)
+    return describe_network_error(exc)
 
 
 def test_model(route, model, timeout=30):
@@ -500,7 +507,7 @@ def test_model(route, model, timeout=30):
     for attempt in range(2):
         request = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open_app_request(request, timeout=timeout) as response:
                 body = response.read(4096).decode("utf-8", errors="replace")
             latency = int((time.time() - start) * 1000)
             return True, latency, body[:300]
@@ -629,7 +636,7 @@ def check_claude_route_integrity(route, timeout=45):
     )
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_app_request(request, timeout=timeout) as response:
             response_body = response.read(256 * 1024).decode("utf-8", errors="replace")
             final_url = response.geturl() or request_url
             status = response.status
@@ -701,6 +708,9 @@ def check_claude_route_integrity(route, timeout=45):
 def _format_claude_probe_error(exc, request_url):
     """Turn common Claude transport failures into an actionable diagnostic."""
     text = str(exc)
+    described = describe_network_error(exc)
+    if described != text:
+        return described
     reason = getattr(exc, "reason", None)
     if isinstance(reason, socket.gaierror) or "getaddrinfo failed" in text:
         host = urllib.parse.urlparse(request_url).hostname or "该域名"
@@ -1402,6 +1412,37 @@ class App(tk.Tk):
         self._refresh_global_status()
 
     def _build_ui(self):
+        utility_bar = tk.Frame(self, bg="#f4f4f4", pady=3)
+        utility_bar.pack(fill="x", padx=6, pady=(6, 0))
+        tk.Label(
+            utility_bar,
+            text="本软件检测网络：",
+            bg="#f4f4f4",
+            fg="#666",
+        ).pack(side="left", padx=(8, 2))
+        self.app_network_label = tk.Label(
+            utility_bar,
+            text=network_config_display(),
+            bg="#f4f4f4",
+            fg="#1565C0",
+            font=("", 9, "bold"),
+        )
+        self.app_network_label.pack(side="left")
+        tk.Button(
+            utility_bar,
+            text="?",
+            width=3,
+            command=self._open_help,
+            relief="flat",
+            cursor="hand2",
+        ).pack(side="right", padx=(2, 6))
+        tk.Button(
+            utility_bar,
+            text="全局设置",
+            command=self._open_network_settings,
+            relief="flat",
+            cursor="hand2",
+        ).pack(side="right", padx=2)
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=6, pady=6)
         self.claude_tab = tk.Frame(self.notebook)
@@ -1556,6 +1597,18 @@ class App(tk.Tk):
 
         self.codex_panel = CodexPanel(self.codex_tab)
         self.codex_panel.pack(fill="both", expand=True)
+
+    def _open_help(self):
+        HelpDialog(self)
+
+    def _open_network_settings(self):
+        NetworkSettingsDialog(self, on_saved=self._network_settings_saved)
+
+    def _network_settings_saved(self, config):
+        self.app_network_label.config(text=network_config_display(config))
+        self.status_var.set(
+            "本软件检测网络已更新；不会修改 Codex、Claude或系统代理。"
+        )
 
     # ── 全局状态 ──────────────────────────────────────────────────────────────
 

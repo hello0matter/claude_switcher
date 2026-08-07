@@ -86,13 +86,13 @@ class ClaudeSwitcherTests(unittest.TestCase):
         with mock.patch.object(
             claude_switcher.secrets, "token_hex", return_value="abc123"
         ), mock.patch.object(
-            claude_switcher.urllib.request, "urlopen", return_value=context
-        ) as urlopen:
+            claude_switcher, "open_app_request", return_value=context
+        ) as open_request:
             result = claude_switcher.check_claude_route_integrity(route)
 
         self.assertEqual(result["verdict"], "passed")
         self.assertEqual(result["summary"], "未发现明显投毒迹象")
-        request = urlopen.call_args.args[0]
+        request = open_request.call_args.args[0]
         payload = json.loads(request.data)
         self.assertTrue(payload["stream"])
         self.assertEqual(payload["model"], "claude-test")

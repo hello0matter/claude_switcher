@@ -1,1 +1,2 @@
 tomlkit>=0.12,<1
+PySocks>=1.7,<2
