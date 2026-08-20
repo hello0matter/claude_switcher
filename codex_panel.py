@@ -203,8 +203,12 @@ def _write_codex_config(route):
     document["model_provider"] = route["provider_id"]
     if route["model"]:
         document["model"] = route["model"]
+    elif "model" in document:
+        del document["model"]
     if route["reasoning_effort"]:
         document["model_reasoning_effort"] = route["reasoning_effort"]
+    elif "model_reasoning_effort" in document:
+        del document["model_reasoning_effort"]
 
     providers = document.get("model_providers")
     if providers is None:
@@ -797,7 +801,19 @@ def _powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _codex_console_command(binary):
+def _codex_cli_config_args(route):
+    values = [("model_provider", route.get("provider_id"))]
+    if route.get("model"):
+        values.append(("model", route["model"]))
+    if route.get("reasoning_effort"):
+        values.append(("model_reasoning_effort", route["reasoning_effort"]))
+    args = []
+    for key, value in values:
+        args.extend(["-c", f"{key}={json.dumps(str(value), ensure_ascii=False)}"])
+    return args
+
+
+def _codex_console_command(binary, route=None):
     if binary == "codex":
         executable = os.environ.get("CODEX_COMMAND", "codex")
     elif binary == "codexx":
@@ -806,9 +822,10 @@ def _codex_console_command(binary):
         executable = str(CODEXX_EXE)
     else:
         raise ValueError(f"?? Codex ????{binary}")
-    invocation = "& " + " ".join(
-        _powershell_quote(value) for value in [executable, "--yolo"]
-    )
+    arguments = [executable, "--yolo"]
+    if route is not None:
+        arguments.extend(_codex_cli_config_args(route))
+    invocation = "& " + " ".join(_powershell_quote(value) for value in arguments)
     return [_powershell_console(), "-NoExit", "-Command", invocation]
 
 
@@ -1533,7 +1550,9 @@ class CodexPanel(tk.Frame):
         else:
             current_text = provider_id or "(未设置)"
         self.current_label.config(text=current_text)
-        self.model_label.config(text="model: " + str(config.get("model") or "(未设置)"))
+        model = str(config.get("model") or "(未设置)")
+        reasoning = str(config.get("model_reasoning_effort") or "模型默认值")
+        self.model_label.config(text=f"model: {model}  |  推理强度: {reasoning}")
 
     def add(self):
         editor = CodexRouteEditor(self)
@@ -1689,7 +1708,7 @@ class CodexPanel(tk.Frame):
         try:
             if route is not None:
                 self._apply(route)
-            command = _codex_console_command(binary)
+            command = _codex_console_command(binary, route)
             subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_CONSOLE)
             self.status_var.set(f"已用 {route['name']} 启动 {display_name}")
         except FileNotFoundError as exc:

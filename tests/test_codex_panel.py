@@ -367,6 +367,49 @@ class CodexPanelCoreTests(unittest.TestCase):
                     ["pwsh.exe", "-NoExit", "-Command", "& 'codex' '--yolo'"],
                 )
 
+    def test_launch_command_locks_selected_model_and_reasoning(self):
+        route = {
+            "provider_id": "xin route",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+        }
+        with mock.patch.object(codex_panel, "_powershell_console", return_value="pwsh.exe"):
+            self.assertEqual(
+                codex_panel._codex_console_command("codex", route),
+                [
+                    "pwsh.exe",
+                    "-NoExit",
+                    "-Command",
+                    "& 'codex' '--yolo' '-c' 'model_provider=\"xin route\"' "
+                    "'-c' 'model=\"gpt-5.6-sol\"' '-c' 'model_reasoning_effort=\"high\"'",
+                ],
+            )
+
+    def test_write_config_clears_unspecified_model_and_reasoning(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.toml"
+            config.write_text(
+                'model = "old"\n'
+                'model_reasoning_effort = "high"\n'
+                'model_provider = "old_provider"\n',
+                encoding="utf-8",
+            )
+            route = codex_panel._normalise_route({
+                "name": "Default model route",
+                "provider_id": "example",
+                "wire_api": "responses",
+            })
+            with mock.patch.object(codex_panel, "CODEX_HOME", root), mock.patch.object(
+                codex_panel, "CODEX_CONFIG_FILE", config
+            ):
+                codex_panel._write_codex_config(route)
+
+            parsed = codex_panel.tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertNotIn("model", parsed)
+            self.assertNotIn("model_reasoning_effort", parsed)
+            self.assertEqual(parsed["model_provider"], "example")
+
     def test_fast_visibility_sync_does_not_scan_rollout_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
