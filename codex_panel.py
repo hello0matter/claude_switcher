@@ -748,12 +748,13 @@ def optimize_codex_resume_database():
     )
 
 
-def align_codex_session_provider(session_id, provider_id):
-    """Move one session to a selected provider without launching Codex.
+def align_codex_session_provider(session_id, provider_id, model=None, reasoning_effort=None):
+    """Move one session to a selected route without launching Codex.
 
     This deliberately touches only the requested session. Older global visibility
     synchronization changed hundreds of unrelated sessions and made route filters
-    misleading.
+    misleading. Newer Codex versions also persist model and reasoning effort on
+    each thread, so those fields are updated when a complete route is supplied.
     """
     if not CODEX_DB_FILE.exists():
         return {"found": False, "db_updated": False, "rollout_updated": False}
@@ -761,32 +762,66 @@ def align_codex_session_provider(session_id, provider_id):
     db = sqlite3.connect(CODEX_DB_FILE, timeout=10)
     try:
         db.execute("PRAGMA busy_timeout = 10000")
+        columns = {item[1] for item in db.execute("PRAGMA table_info(threads)")}
+        selected_columns = ["model_provider", "rollout_path"]
+        if "model" in columns:
+            selected_columns.append("model")
+        if "reasoning_effort" in columns:
+            selected_columns.append("reasoning_effort")
         row = db.execute(
-            "SELECT model_provider, rollout_path FROM threads WHERE id = ?",
+            f"SELECT {', '.join(selected_columns)} FROM threads WHERE id = ?",
             (session_id,),
         ).fetchone()
         if row is None:
             return {"found": False, "db_updated": False, "rollout_updated": False}
 
-        old_provider, rollout_path = row
+        old_provider, rollout_path = row[:2]
+        old_model = row[selected_columns.index("model")] if "model" in columns else None
+        old_reasoning = (
+            row[selected_columns.index("reasoning_effort")]
+            if "reasoning_effort" in columns
+            else None
+        )
         rollout_updated = False
         if rollout_path:
             path = Path(rollout_path)
             if path.is_file():
                 rollout_updated = _rewrite_session_meta_providers(path, provider_id)
 
-        db_updated = old_provider != provider_id
+        values = {"model_provider": provider_id}
+        if "model" in columns and model is not None:
+            values["model"] = model or None
+        if "reasoning_effort" in columns and reasoning_effort is not None:
+            values["reasoning_effort"] = reasoning_effort or None
+        db_updated = any(
+            old_value != values[column]
+            for column, old_value in (
+                ("model_provider", old_provider),
+                ("model", old_model),
+                ("reasoning_effort", old_reasoning),
+            )
+            if column in values
+        )
         if db_updated:
             with db:
+                assignments = ", ".join(f"{column} = ?" for column in values)
                 db.execute(
-                    "UPDATE threads SET model_provider = ? WHERE id = ?",
-                    (provider_id, session_id),
+                    f"UPDATE threads SET {assignments} WHERE id = ?",
+                    (*values.values(), session_id),
                 )
-        return {
+        result = {
             "found": True,
             "db_updated": db_updated,
             "rollout_updated": rollout_updated,
         }
+        if model is not None:
+            result["model_updated"] = "model" in values and old_model != values["model"]
+        if reasoning_effort is not None:
+            result["reasoning_updated"] = (
+                "reasoning_effort" in values
+                and old_reasoning != values["reasoning_effort"]
+            )
+        return result
     except sqlite3.Error as exc:
         raise RuntimeError("无法修复该 Session 的 Codex 路线索引") from exc
     finally:
@@ -803,8 +838,6 @@ def _powershell_quote(value: str) -> str:
 
 def _codex_cli_config_args(route):
     values = [("model_provider", route.get("provider_id"))]
-    if route.get("model"):
-        values.append(("model", route["model"]))
     if route.get("reasoning_effort"):
         values.append(("model_reasoning_effort", route["reasoning_effort"]))
     args = []
@@ -822,9 +855,12 @@ def _codex_console_command(binary, route=None):
         executable = str(CODEXX_EXE)
     else:
         raise ValueError(f"?? Codex ????{binary}")
-    arguments = [executable, "--yolo"]
+    arguments = [executable]
     if route is not None:
+        if route.get("model"):
+            arguments.extend(["-m", str(route["model"])])
         arguments.extend(_codex_cli_config_args(route))
+    arguments.append("--yolo")
     invocation = "& " + " ".join(_powershell_quote(value) for value in arguments)
     return [_powershell_console(), "-NoExit", "-Command", invocation]
 
@@ -1418,7 +1454,7 @@ class CodexPanel(tk.Frame):
 
         tk.Button(
             action,
-            text="切换到选中路线并迁移此 Session（不启动）",
+            text="迁移此 Session：路线、模型和推理强度（不启动）",
             command=self.move_session_to_selected_route,
             bg="#2563a6",
             fg="white",
@@ -1662,7 +1698,10 @@ class CodexPanel(tk.Frame):
             messagebox.showwarning("提示", "请先粘贴 Session ID", parent=self)
             return
         try:
-            result = align_codex_session_provider(session_id, route["provider_id"])
+            align_args = [session_id, route["provider_id"]]
+            if "model" in route or "reasoning_effort" in route:
+                align_args.extend((route.get("model"), route.get("reasoning_effort")))
+            result = align_codex_session_provider(*align_args)
             if not result["found"]:
                 messagebox.showwarning(
                     "没有找到 Session",
@@ -1672,14 +1711,14 @@ class CodexPanel(tk.Frame):
                 return
             self._apply(route)
             change_note = (
-                "路线记录已修改"
+                "路线、模型和推理强度已修改"
                 if result["db_updated"] or result["rollout_updated"]
                 else "原本已经属于该路线"
             )
             self.status_var.set(
                 f"{change_note}：{session_id} → {route['name']}。未打开窗口；"
-                "现在可以自行运行 resume。若仍提示“高需求”，通常是目标站拒绝旧历史内容，"
-                "并非配置没有切换。"
+                f"现在运行 resume 会使用 {route.get('model') or '模型默认值'} / "
+                f"{route.get('reasoning_effort') or '默认推理强度'}。"
             )
         except Exception as exc:
             messagebox.showerror("Session 路线迁移失败", str(exc), parent=self)

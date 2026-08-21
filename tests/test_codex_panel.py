@@ -380,9 +380,52 @@ class CodexPanelCoreTests(unittest.TestCase):
                     "pwsh.exe",
                     "-NoExit",
                     "-Command",
-                    "& 'codex' '--yolo' '-c' 'model_provider=\"xin route\"' "
-                    "'-c' 'model=\"gpt-5.6-sol\"' '-c' 'model_reasoning_effort=\"high\"'",
+                    "& 'codex' '-m' 'gpt-5.6-sol' '-c' 'model_provider=\"xin route\"' "
+                    "'-c' 'model_reasoning_effort=\"high\"' '--yolo'",
                 ],
+            )
+
+    def test_align_one_session_route_updates_model_and_reasoning(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "state_5.sqlite"
+            db = sqlite3.connect(database)
+            with db:
+                db.execute("""
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        model_provider TEXT NOT NULL,
+                        rollout_path TEXT NOT NULL,
+                        model TEXT,
+                        reasoning_effort TEXT
+                    )
+                """)
+                db.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?, ?)",
+                    ("thread-route", "mc", "", "gpt-5.6-sol", "medium"),
+                )
+            db.close()
+
+            with mock.patch.object(codex_panel, "CODEX_DB_FILE", database):
+                result = codex_panel.align_codex_session_provider(
+                    "thread-route", "mc", "gpt-5.6-terra", "high"
+                )
+
+            db = sqlite3.connect(database)
+            row = db.execute(
+                "SELECT model_provider, model, reasoning_effort FROM threads WHERE id = ?",
+                ("thread-route",),
+            ).fetchone()
+            db.close()
+            self.assertEqual(row, ("mc", "gpt-5.6-terra", "high"))
+            self.assertEqual(
+                result,
+                {
+                    "found": True,
+                    "db_updated": True,
+                    "rollout_updated": False,
+                    "model_updated": True,
+                    "reasoning_updated": True,
+                },
             )
 
     def test_write_config_clears_unspecified_model_and_reasoning(self):
