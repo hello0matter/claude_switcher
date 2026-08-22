@@ -22,6 +22,7 @@ from app_network import (
     network_config_display,
     open_app_request,
 )
+from benchmark_dialog import BenchmarkDialog
 from cost_comparison import CostComparisonDialog
 from help_dialog import HelpDialog
 
@@ -1563,6 +1564,14 @@ class App(tk.Tk):
             cursor="hand2",
         ).pack(side="left", fill="x", expand=True, padx=(2, 0))
 
+        tk.Button(
+            btn_area,
+            text="🧠  能力体检 / 智商对比（每条路线 6 题）",
+            command=self._open_benchmark,
+            bg="#6A1B9A", fg="white", font=("", 10, "bold"),
+            relief="flat", padx=8, pady=5, cursor="hand2",
+        ).pack(fill="x", pady=(0, 6))
+
         integrity_row = tk.Frame(btn_area)
         integrity_row.pack(fill="x", pady=(0, 6))
         self.route_integrity_button = tk.Button(
@@ -1679,6 +1688,17 @@ class App(tk.Tk):
                 }
             )
         CostComparisonDialog(self, items)
+
+    def _open_benchmark(self):
+        indexes = self._selected_indices()
+        if not indexes:
+            messagebox.showwarning("请选择路线", "至少选择一条 Claude 路线；按住 Ctrl 可多选对比。", parent=self)
+            return
+        entries = [
+            {"kind": "claude", "name": self.routes[index].get("name", "未命名"), "route": self.routes[index]}
+            for index in indexes
+        ]
+        BenchmarkDialog(self, entries)
 
     def _check_selected_route_integrity(self):
         idx = self._selected_idx()

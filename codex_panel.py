@@ -26,6 +26,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 from app_network import describe_network_error, open_app_request
+from benchmark_dialog import BenchmarkDialog
 from cost_comparison import CostComparisonDialog
 
 try:
@@ -1492,6 +1493,16 @@ class CodexPanel(tk.Frame):
             relief="flat",
             pady=5,
         ).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        tk.Button(
+            action,
+            text="能力体检 / 智商对比（每条路线 6 题）",
+            command=self.open_benchmark,
+            bg="#6a1b9a",
+            fg="white",
+            font=("", 10, "bold"),
+            relief="flat",
+            pady=5,
+        ).pack(fill="x", pady=(0, 4))
         integrity_row = tk.Frame(action)
         integrity_row.pack(fill="x", pady=(0, 4))
         self.route_integrity_button = tk.Button(
@@ -1787,6 +1798,17 @@ class CodexPanel(tk.Frame):
                 }
             )
         CostComparisonDialog(self, items)
+
+    def open_benchmark(self):
+        indexes = self.selected_indices()
+        if not indexes:
+            messagebox.showwarning("请选择路线", "至少选择一条 Codex 路线；按住 Ctrl 可多选对比。", parent=self)
+            return
+        entries = [
+            {"kind": "codex", "name": self.routes[index].get("name", "未命名"), "route": self.routes[index]}
+            for index in indexes
+        ]
+        BenchmarkDialog(self, entries)
 
     def check_selected_route_integrity(self):
         route = self._selected_route()
