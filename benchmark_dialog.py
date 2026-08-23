@@ -11,7 +11,7 @@ class BenchmarkDialog(tk.Toplevel):
 
     def __init__(self, parent, entries):
         super().__init__(parent)
-        self.title("能力体检 / 智商对比（非临床 IQ 测量）")
+        self.title("路线能力对比（不是 IQ 测量）")
         self.geometry("900x560")
         self.minsize(760, 430)
         counts = {}
@@ -43,7 +43,7 @@ class BenchmarkDialog(tk.Toplevel):
     def _build_ui(self):
         intro = (
             f"固定 {len(BENCHMARK_TASKS)} 题：算术、规律、逻辑、代码、约束和指令遵循。"
-            "每条路线发送 6 次短请求，按返回的 FINAL 答案计分；不是科学 IQ 分数。"
+            "每条路线发送 6 次短请求，用同一套题比较路线差异；不是科学 IQ 分数。"
         )
         tk.Label(self, text=intro, anchor="w", justify="left", fg="#555").pack(fill="x", padx=12, pady=(10, 4))
         controls = tk.Frame(self)

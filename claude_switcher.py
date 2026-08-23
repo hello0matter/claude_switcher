@@ -1566,7 +1566,7 @@ class App(tk.Tk):
 
         tk.Button(
             btn_area,
-            text="🧠  能力体检 / 智商对比（每条路线 6 题）",
+            text="🧠  路线能力对比（每条路线 6 题）",
             command=self._open_benchmark,
             bg="#6A1B9A", fg="white", font=("", 10, "bold"),
             relief="flat", padx=8, pady=5, cursor="hand2",

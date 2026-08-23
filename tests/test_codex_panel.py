@@ -453,6 +453,30 @@ class CodexPanelCoreTests(unittest.TestCase):
             self.assertNotIn("model_reasoning_effort", parsed)
             self.assertEqual(parsed["model_provider"], "example")
 
+    def test_write_config_persists_disable_response_storage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.toml"
+            route = codex_panel._normalise_route({
+                "name": "Storage disabled",
+                "provider_id": "example",
+                "disable_response_storage": True,
+            })
+            with mock.patch.object(codex_panel, "CODEX_HOME", root), mock.patch.object(
+                codex_panel, "CODEX_CONFIG_FILE", config
+            ):
+                codex_panel._write_codex_config(route)
+            parsed = codex_panel.tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertIs(parsed["disable_response_storage"], True)
+
+            route["disable_response_storage"] = False
+            with mock.patch.object(codex_panel, "CODEX_HOME", root), mock.patch.object(
+                codex_panel, "CODEX_CONFIG_FILE", config
+            ):
+                codex_panel._write_codex_config(route)
+            parsed = codex_panel.tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertIs(parsed["disable_response_storage"], False)
+
     def test_fast_visibility_sync_does_not_scan_rollout_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

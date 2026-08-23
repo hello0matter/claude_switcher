@@ -100,6 +100,7 @@ def _normalise_route(route):
         "api_key": "",
         "model": "",
         "reasoning_effort": "",
+        "disable_response_storage": None,
         "wire_api": "responses",
         "models": [],
         "note": "",
@@ -111,6 +112,13 @@ def _normalise_route(route):
     result["api_key"] = str(result.get("api_key") or "").strip()
     result["model"] = str(result.get("model") or "").strip()
     result["reasoning_effort"] = str(result.get("reasoning_effort") or "").strip()
+    storage = result.get("disable_response_storage")
+    if storage in (True, False):
+        result["disable_response_storage"] = storage
+    elif str(storage or "").strip().lower() in {"true", "false"}:
+        result["disable_response_storage"] = str(storage).strip().lower() == "true"
+    else:
+        result["disable_response_storage"] = None
     result["wire_api"] = str(result.get("wire_api") or "responses").strip()
     models = result.get("models", [])
     if isinstance(models, str):
@@ -136,6 +144,7 @@ def _routes_from_codex_config():
     current_provider = str(config.get("model_provider") or "")
     current_model = str(config.get("model") or "")
     current_reasoning = str(config.get("model_reasoning_effort") or "")
+    current_storage = config.get("disable_response_storage")
     routes = []
     for provider_id, provider in (config.get("model_providers") or {}).items():
         if not isinstance(provider, dict):
@@ -147,6 +156,7 @@ def _routes_from_codex_config():
             "api_key": provider.get("experimental_bearer_token", ""),
             "model": current_model if provider_id == current_provider else "",
             "reasoning_effort": current_reasoning if provider_id == current_provider else "",
+            "disable_response_storage": current_storage if provider_id == current_provider else None,
             "wire_api": provider.get("wire_api", "responses"),
             "note": "从 ~/.codex/config.toml 导入",
         }))
@@ -156,6 +166,7 @@ def _routes_from_codex_config():
             "provider_id": current_provider,
             "model": current_model,
             "reasoning_effort": current_reasoning,
+            "disable_response_storage": current_storage,
         }))
     return routes
 
@@ -210,6 +221,11 @@ def _write_codex_config(route):
         document["model_reasoning_effort"] = route["reasoning_effort"]
     elif "model_reasoning_effort" in document:
         del document["model_reasoning_effort"]
+    if route.get("disable_response_storage") is None:
+        if "disable_response_storage" in document:
+            del document["disable_response_storage"]
+    else:
+        document["disable_response_storage"] = route["disable_response_storage"]
 
     providers = document.get("model_providers")
     if providers is None:
@@ -1215,6 +1231,7 @@ class CodexRouteEditor(tk.Toplevel):
             ("默认模型", "model"),
             ("模型列表（逗号）", "models"),
             ("推理强度", "reasoning_effort"),
+            ("禁用响应存储", "disable_response_storage"),
             ("wire API", "wire_api"),
             ("备注", "note"),
         ]
@@ -1232,6 +1249,17 @@ class CodexRouteEditor(tk.Toplevel):
                     textvariable=var,
                     width=40,
                     values=("", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+                )
+            elif key == "disable_response_storage":
+                current = route.get(key)
+                display = "默认" if current is None else str(current).lower()
+                var.set(display)
+                entry = ttk.Combobox(
+                    self,
+                    textvariable=var,
+                    width=40,
+                    values=("默认", "true", "false"),
+                    state="readonly",
                 )
             elif key == "wire_api":
                 entry = ttk.Combobox(
@@ -1266,6 +1294,11 @@ class CodexRouteEditor(tk.Toplevel):
             messagebox.showwarning("提示", "名称和 provider ID 不能为空", parent=self)
             return
         values["models"] = [item.strip() for item in values["models"].split(",") if item.strip()]
+        storage = values["disable_response_storage"].lower()
+        values["disable_response_storage"] = {
+            "true": True,
+            "false": False,
+        }.get(storage)
         self.result = _normalise_route(values)
         self.destroy()
 
@@ -1433,8 +1466,8 @@ class CodexPanel(tk.Frame):
         tk.Label(right, text="Codex 详情", font=("", 10, "bold")).pack(anchor="w")
         detail = tk.LabelFrame(right, padx=8, pady=6)
         detail.pack(fill="x", expand=False)
-        self.detail_vars = {key: tk.StringVar() for key in ("name", "provider_id", "base_url", "api_key", "model", "reasoning_effort", "wire_api", "note")}
-        for label, key in (("名称", "name"), ("provider ID", "provider_id"), ("API 地址", "base_url"), ("Bearer 密钥", "api_key"), ("模型", "model"), ("推理强度", "reasoning_effort"), ("wire API", "wire_api"), ("备注", "note")):
+        self.detail_vars = {key: tk.StringVar() for key in ("name", "provider_id", "base_url", "api_key", "model", "reasoning_effort", "disable_response_storage", "wire_api", "note")}
+        for label, key in (("名称", "name"), ("provider ID", "provider_id"), ("API 地址", "base_url"), ("Bearer 密钥", "api_key"), ("模型", "model"), ("推理强度", "reasoning_effort"), ("禁用响应存储", "disable_response_storage"), ("wire API", "wire_api"), ("备注", "note")):
             row = tk.Frame(detail)
             row.pack(fill="x", pady=2)
             tk.Label(row, text=label + ":", width=13, anchor="w", fg="#666").pack(side="left")
@@ -1495,7 +1528,7 @@ class CodexPanel(tk.Frame):
         ).pack(side="left", fill="x", expand=True, padx=(2, 0))
         tk.Button(
             action,
-            text="能力体检 / 智商对比（每条路线 6 题）",
+            text="路线能力对比（每条路线 6 题）",
             command=self.open_benchmark,
             bg="#6a1b9a",
             fg="white",
@@ -1585,6 +1618,8 @@ class CodexPanel(tk.Frame):
         route = self.routes[index]
         for key in ("name", "provider_id", "base_url", "model", "reasoning_effort", "wire_api", "note"):
             self.detail_vars[key].set(route.get(key) or "(未设置)")
+        storage = route.get("disable_response_storage")
+        self.detail_vars["disable_response_storage"].set("默认" if storage is None else str(storage).lower())
         self.detail_vars["api_key"].set(_mask_secret(route.get("api_key")))
 
     def refresh_status(self):
