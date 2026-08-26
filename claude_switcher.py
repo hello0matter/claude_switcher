@@ -6,8 +6,6 @@ import os
 import secrets
 import socket
 import subprocess
-import winreg
-import ctypes
 import threading
 import time
 import urllib.error
@@ -16,6 +14,8 @@ import urllib.request
 import uuid
 
 from codex_panel import CodexPanel
+import terminal_launch
+import user_env
 from app_network import (
     NetworkSettingsDialog,
     describe_network_error,
@@ -117,7 +117,6 @@ DEFAULT_MODEL_ROWS = [
 
 # ── 系统环境变量读写（用户级）────────────────────────────────────────────────
 
-REG_PATH = r"Environment"  # HKCU\Environment
 def sync_clawgod_warlord(route):
     """同步 ClawGod provider.json；注意 ClawGod 当前会同时注入 API_KEY 和 AUTH_TOKEN。"""
     is_oauth = bool(route.get("oauth_json", "").strip())
@@ -134,34 +133,16 @@ def sync_clawgod_warlord(route):
             json.dump(provider_data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+# 用户级环境变量：Windows 写 HKCU\Environment 注册表，Linux/macOS 写
+# ~/.claude_switcher_env.json 并同步到 ~/.bashrc / ~/.zshenv 的受管区块。
 def _get_user_env(name):
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH) as k:
-            val, _ = winreg.QueryValueEx(k, name)
-            return val
-    except FileNotFoundError:
-        return None
+    return user_env.get_value(name)
 
 def _set_user_env(name, value):
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
-        winreg.SetValueEx(k, name, 0, winreg.REG_EXPAND_SZ, value)
-    HWND_BROADCAST = 0xFFFF
-    WM_SETTINGCHANGE = 0x001A
-    ctypes.windll.user32.SendMessageTimeoutW(
-        HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", 2, 1000, None
-    )
+    user_env.set_value(name, value)
 
 def _del_user_env(name):
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
-            winreg.DeleteValue(k, name)
-        HWND_BROADCAST = 0xFFFF
-        WM_SETTINGCHANGE = 0x001A
-        ctypes.windll.user32.SendMessageTimeoutW(
-            HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", 2, 1000, None
-        )
-    except FileNotFoundError:
-        pass
+    user_env.delete_value(name)
 
 def get_global_route():
     return _get_user_env("ANTHROPIC_BASE_URL")
@@ -1934,15 +1915,21 @@ class App(tk.Tk):
         else:
             env.pop("ANTHROPIC_MODEL", None)
         try:
-            subprocess.Popen(
-                ["cmd", "/k", "claude"],
-                env=env,
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-            )
+            if terminal_launch.is_windows():
+                subprocess.Popen(
+                    ["cmd", "/k", "claude"],
+                    env=env,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+            else:
+                subprocess.Popen(
+                    terminal_launch.new_terminal_argv(["claude"]),
+                    env=env,
+                )
             extra = "，ClawGod 已同步" if self.sync_clawgod_var.get() else ""
             self.status_var.set(f"已启动（settings.json 已同步{extra}）：{r['name']}")
-        except FileNotFoundError:
-            messagebox.showerror("错误", "找不到 claude 命令\n请确认 Claude Code 已安装并在 PATH 中")
+        except FileNotFoundError as exc:
+            messagebox.showerror("错误", str(exc))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from tkinter import messagebox, simpledialog, ttk
 from app_network import describe_network_error, open_app_request
 from benchmark_dialog import BenchmarkDialog
 from cost_comparison import CostComparisonDialog
+import terminal_launch
 
 try:
     import tomlkit
@@ -41,10 +42,11 @@ CODEX_ROUTES_FILE = Path.home() / ".codex_routes.json"
 CODEX_SESSION_BACKUP_DIR = CODEX_HOME / "session-meta-backups"
 CODEX_DB_BACKUP_DIR = CODEX_HOME / "db-backups"
 CODEX_DB_FILE = CODEX_HOME / "state_5.sqlite"
+CODEXX_NAME = "codexx.exe" if os.name == "nt" else "codexx"
 CODEXX_EXE = Path(
     os.environ.get(
         "CODEXX_EXE",
-        CODEX_HOME / ".sandbox-bin" / "codexx.exe",
+        CODEX_HOME / ".sandbox-bin" / CODEXX_NAME,
     )
 )
 VISIBILITY_SETTINGS_TABLE = "codex_resume_visibility_settings"
@@ -878,8 +880,10 @@ def _codex_console_command(binary, route=None):
             arguments.extend(["-m", str(route["model"])])
         arguments.extend(_codex_cli_config_args(route))
     arguments.append("--yolo")
-    invocation = "& " + " ".join(_powershell_quote(value) for value in arguments)
-    return [_powershell_console(), "-NoExit", "-Command", invocation]
+    if os.name == "nt":
+        invocation = "& " + " ".join(_powershell_quote(value) for value in arguments)
+        return [_powershell_console(), "-NoExit", "-Command", invocation]
+    return terminal_launch.new_terminal_argv(arguments)
 
 
 def _openai_url(base_url, endpoint):
@@ -1794,7 +1798,10 @@ class CodexPanel(tk.Frame):
             if route is not None:
                 self._apply(route)
             command = _codex_console_command(binary, route)
-            subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            popen_kwargs = {}
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+            subprocess.Popen(command, **popen_kwargs)
             self.status_var.set(f"已用 {route['name']} 启动 {display_name}")
         except FileNotFoundError as exc:
             detail = str(exc) if str(exc) else f"找不到 {display_name} 二进制文件"
