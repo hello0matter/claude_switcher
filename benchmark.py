@@ -6,6 +6,7 @@ benchmark for comparing the same model through different providers.
 
 import json
 import os
+import random
 import re
 import time
 import urllib.error
@@ -72,6 +73,68 @@ BENCHMARK_TASKS = (
         "expected": "NO",
     },
 )
+
+
+def generate_benchmark_tasks(count=6, seed=None):
+    """Generate deterministic-per-run task variants shared by all routes."""
+    count = max(1, int(count))
+    rng = random.Random(seed)
+    tasks = []
+    for index in range(count):
+        kind = index % 6
+        if kind == 0:
+            rows = rng.randint(4, 12)
+            each = rng.randint(5, 12)
+            removed = rng.randint(1, rows * each - 1)
+            task = {
+                "id": f"arithmetic-{index}", "category": "算术",
+                "prompt": f"A box has {rows} rows of {each} balls and {removed} are removed. How many remain? Reply only as FINAL: <integer>.",
+                "expected": str(rows * each - removed),
+            }
+        elif kind == 1:
+            start = rng.randint(2, 10)
+            step = rng.randint(2, 8)
+            terms = [start + step * n + n * (n - 1) for n in range(5)]
+            task = {
+                "id": f"sequence-{index}", "category": "规律",
+                "prompt": f"Find the next number in {', '.join(map(str, terms))}, ?. Reply only as FINAL: <integer>.",
+                "expected": str(start + step * 5 + 5 * 4),
+            }
+        elif kind == 2:
+            true_index = rng.randrange(3)
+            a = rng.choice((2, 4, 6)) if true_index != 0 else rng.choice((1, 3, 5))
+            b = rng.choice((1, 3, 5)) if true_index != 1 else rng.choice((2, 4, 6))
+            c = rng.choice((1, 2)) if true_index != 2 else rng.choice((3, 4))
+            task = {
+                "id": f"logic-{index}", "category": "逻辑",
+                "prompt": f"Exactly one statement is true: A says {a} is odd; B says {b} is even; C says {c} is greater than 2. Which letter is true? Reply only as FINAL: <A|B|C>.",
+                "expected": "ABC"[true_index],
+            }
+        elif kind == 3:
+            values = rng.sample(range(1, 8), 3)
+            expected = sum(value * value for value in values if value > 2)
+            task = {
+                "id": f"code-{index}", "category": "代码",
+                "prompt": f"What is printed by Python: x = {values}; print(sum(i*i for i in x if i > 2))? Reply only as FINAL: <integer>.",
+                "expected": str(expected),
+            }
+        elif kind == 4:
+            names = rng.sample(("Mia", "Noah", "Omar", "Pia", "Quinn"), 4)
+            task = {
+                "id": f"constraint-{index}", "category": "约束",
+                "prompt": f"Tallest order is {names[0]} > {names[1]} > {names[2]} > {names[3]}. Who is second tallest? Reply only as FINAL: <name>.",
+                "expected": names[1],
+            }
+        else:
+            number = rng.randint(10, 99)
+            answer = "YES" if number % 2 == 0 else "NO"
+            task = {
+                "id": f"instruction-{index}", "category": "指令遵循",
+                "prompt": f"Answer without explanation: Is {number} an even number? Reply only as FINAL: YES or NO.",
+                "expected": answer,
+            }
+        tasks.append(task)
+    return tuple(tasks)
 
 
 def _endpoint(base_url, suffix):
@@ -226,9 +289,10 @@ def _request_task(route, kind, task, timeout):
         return {"ok": False, "answer": "", "text": "", "latency_ms": f"{(time.perf_counter() - started) * 1000:.0f}", "tokens": None, "error": describe_network_error(exc)}
 
 
-def run_route_benchmark(route, kind, timeout=45):
+def run_route_benchmark(route, kind, timeout=45, tasks=None):
+    tasks = tuple(tasks or BENCHMARK_TASKS)
     results = []
-    for task in BENCHMARK_TASKS:
+    for task in tasks:
         result = _request_task(route, kind, task, timeout)
         result.update(id=task["id"], category=task["category"], expected=task["expected"], passed=result["answer"] == task["expected"].lower())
         results.append(result)

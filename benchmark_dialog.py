@@ -3,7 +3,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from benchmark import BENCHMARK_TASKS, run_route_benchmark
+from benchmark import BENCHMARK_TASKS, generate_benchmark_tasks, run_route_benchmark
 
 
 class BenchmarkDialog(tk.Toplevel):
@@ -25,6 +25,7 @@ class BenchmarkDialog(tk.Toplevel):
             )
             self.entries.append(entry)
         self.results = {}
+        self.tasks = BENCHMARK_TASKS
         self.running = False
         self.closed = False
         self.baseline_var = tk.StringVar(value=self._default_baseline())
@@ -42,8 +43,8 @@ class BenchmarkDialog(tk.Toplevel):
 
     def _build_ui(self):
         intro = (
-            f"固定 {len(BENCHMARK_TASKS)} 题：算术、规律、逻辑、代码、约束和指令遵循。"
-            "每条路线发送 6 次短请求，用同一套题比较路线差异；不是科学 IQ 分数。"
+            "随机生成同一套题给所有路线，覆盖算术、规律、逻辑、代码、约束和指令遵循。"
+            "这是路线能力比较，不是科学 IQ 分数。"
         )
         tk.Label(self, text=intro, anchor="w", justify="left", fg="#555").pack(fill="x", padx=12, pady=(10, 4))
         controls = tk.Frame(self)
@@ -53,7 +54,10 @@ class BenchmarkDialog(tk.Toplevel):
         baseline_box = ttk.Combobox(controls, textvariable=self.baseline_var, values=names, state="readonly", width=30)
         baseline_box.pack(side="left", padx=4)
         baseline_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh())
-        tk.Button(controls, text="开始能力体检（每条路线 6 题）", command=self._start, bg="#1565C0", fg="white", relief="flat", pady=5).pack(side="left", padx=10)
+        tk.Label(controls, text="测试强度：").pack(side="left", padx=(16, 2))
+        self.level_var = tk.StringVar(value="基础（6题）")
+        ttk.Combobox(controls, textvariable=self.level_var, values=("基础（6题）", "标准（30题）", "严格（60题）"), state="readonly", width=14).pack(side="left")
+        tk.Button(controls, text="开始路线能力对比", command=self._start, bg="#1565C0", fg="white", relief="flat", pady=5).pack(side="left", padx=10)
         tk.Label(controls, textvariable=self.status_var, fg="#666").pack(side="right")
 
         body = tk.Frame(self)
@@ -114,6 +118,15 @@ class BenchmarkDialog(tk.Toplevel):
             return
         self.running = True
         self.results.clear()
+        count = {"基础（6题）": 6, "标准（30题）": 30, "严格（60题）": 60}[self.level_var.get()]
+        if count > 6 and not messagebox.askyesno(
+            "确认测试量",
+            f"将对 {len(self.entries)} 条路线各发送 {count} 次请求，可能产生较多 token 消耗。继续？",
+            parent=self,
+        ):
+            self.running = False
+            return
+        self.tasks = generate_benchmark_tasks(count)
         self._refresh()
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -122,7 +135,7 @@ class BenchmarkDialog(tk.Toplevel):
             if self.closed:
                 break
             self.after(0, self.status_var.set, f"测试中 {offset}/{len(self.entries)}：{entry['name']}")
-            result = run_route_benchmark(copy.deepcopy(entry["route"]), entry["kind"])
+            result = run_route_benchmark(copy.deepcopy(entry["route"]), entry["kind"], tasks=self.tasks)
             self.results[entry["name"]] = result
             self.after(0, self._refresh)
         self.running = False
@@ -138,7 +151,7 @@ class BenchmarkDialog(tk.Toplevel):
         if not result:
             return
         lines = [f"路线：{name}", f"得分：{result['score']}/{result['total']} ({result['percent']}%)", ""]
-        for task, item in zip(BENCHMARK_TASKS, result["results"]):
+        for task, item in zip(self.tasks, result["results"]):
             status = "通过" if item["passed"] else "失败"
             answer = item["answer"] or "无"
             detail = f"；{item['error']}" if item["error"] else ""

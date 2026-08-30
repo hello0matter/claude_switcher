@@ -1,6 +1,6 @@
 import unittest
 
-from benchmark import _objects, _response_text, extract_final_answer
+from benchmark import _objects, _response_text, extract_final_answer, generate_benchmark_tasks
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -29,6 +29,12 @@ class BenchmarkTests(unittest.TestCase):
         text, errors = _response_text(_objects(body), "claude")
         self.assertEqual(text, "FINAL: NO")
         self.assertEqual(errors, [])
+
+    def test_generated_tasks_are_reproducible_and_cover_all_categories(self):
+        first = generate_benchmark_tasks(30, seed=123)
+        second = generate_benchmark_tasks(30, seed=123)
+        self.assertEqual(first, second)
+        self.assertEqual({task["category"] for task in first}, {"算术", "规律", "逻辑", "代码", "约束", "指令遵循"})
 
 
 if __name__ == "__main__":
