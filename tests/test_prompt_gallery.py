@@ -42,8 +42,8 @@ class PromptGalleryTests(unittest.TestCase):
         self.assertIn("okai.la", global_html)
         self.assertIn('src="2026-10-23/20261023-153045_xiaomimimo.com_mimo_medium_responses.html"', global_html)
         self.assertIn("未按天归档", global_html)
-        self.assertIn("pointer-events: none", global_html)
-        self.assertIn("68vh", global_html)
+        self.assertIn('class="track"', global_html)
+        self.assertIn("鹈鹕", global_html)
         self.assertIn('src="20261023-153045_xiaomimimo.com_mimo_medium_responses.html"', day_html)
         self.assertIn("../index.html", day_html)
         self.assertNotIn("old.html", day_html)
@@ -51,3 +51,5 @@ class PromptGalleryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

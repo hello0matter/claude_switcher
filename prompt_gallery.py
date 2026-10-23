@@ -90,66 +90,69 @@ def _group_sites(rows):
 
 
 def _card_html(row, href, color):
-    meta = " · ".join(part for part in (row["model"], row["effort"], row["wire"], row["stamp"]) if part)
-    size_note = "空文件或未写完" if row["size"] < 200 else f"{row['size'] // 1024} KB"
+    meta = [
+        ("模型", row["model"] or "未知模型"),
+        ("强度", row["effort"] or "-"),
+        ("形式", row["wire"] or "-"),
+        ("时间", row["stamp"]),
+        ("大小", f"{row['size'] // 1024} KB"),
+    ]
+    meta_html = "".join(
+        f'<span class="meta-item"><em>{html.escape(label)}</em>{html.escape(value)}</span>'
+        for label, value in meta
+        if value
+    )
     title = html.escape(row["host"] or row["name"])
     return f"""
 <article class="card" data-host="{html.escape(row['host'])}" style="--site:{color}">
-  <header>
-    <strong>{title}</strong>
-    <span>{html.escape(meta)}</span>
-    <em>{html.escape(size_note)}</em>
-    <a href="{html.escape(href)}">单独打开</a>
-    <button type="button" class="live-btn">允许卡片内交互</button>
-  </header>
-  <div class="frame-wrap">
-    <div class="overlay" title="滚轮滚动外层页面"></div>
-    <iframe loading="lazy" src="{html.escape(href)}" title="{title}"></iframe>
+  <a class="frame" href="{html.escape(href)}" title="{title}">
+    <iframe loading="lazy" src="{html.escape(href)}" title="{title}" tabindex="-1"></iframe>
+    <div class="overlay"></div>
+  </a>
+  <div class="info">
+    <div class="row1"><strong>{title}</strong><a href="{html.escape(href)}" target="_blank">打开原图</a></div>
+    <div class="meta">{meta_html}</div>
   </div>
 </article>
 """
 
 
 def _page(title, days, home_href, current_folder):
-    day_links = []
-    for day in days:
-        if day["folder"]:
-            href = f"{day['folder']}/index.html" if not current_folder else (
-                "index.html" if day["folder"] == current_folder else f"../{day['folder']}/index.html"
-            )
-        else:
-            href = "#loose" if not current_folder else "../index.html#loose"
-        day_links.append(f'<a href="{html.escape(href)}">{html.escape(day["label"])} ({len(day["rows"])})</a>')
+    total = sum(len(day["rows"]) for day in days)
+    site_count = len({row["host"] for day in days for row in day["rows"] if row["host"]})
     hosts = sorted({row["host"] for day in days for row in day["rows"] if row["host"]})
-    host_buttons = ['<button type="button" data-host="">全部站点</button>']
-    host_buttons.extend(
-        f'<button type="button" data-host="{html.escape(host)}" style="border-color:{_host_color(host)}">{html.escape(host)}</button>'
-        for host in hosts
-    )
+
+    def host_button(host=""):
+        label = host or "全部"
+        style = f" style=\"--dot:{_host_color(host)}\"" if host else ""
+        return f'<button type="button" class="chip host-chip" data-host="{html.escape(host)}"{style}>{html.escape(label)}</button>'
+
+    def day_chip(day):
+        href = "#loose" if not day["folder"] else (f"{day['folder']}/index.html" if not current_folder else (
+            "index.html" if day["folder"] == current_folder else f"../{day['folder']}/index.html"
+        ))
+        return f'<a class="chip" href="{html.escape(href)}">{html.escape(day["label"])} <b>{len(day["rows"])}</b></a>'
+
+    chips = "".join(host_button(host) for host in hosts)
+    day_chips = "".join(day_chip(day) for day in days)
     sections = []
     for day in days:
-        sites = _group_sites(day["rows"])
-        site_html = []
-        for site in sites:
+        blocks = []
+        for site in _group_sites(day["rows"]):
             cards = []
             for row in site["rows"]:
-                if current_folder:
-                    href = row["name"]
-                elif day["folder"]:
-                    href = f"{day['folder']}/{row['name']}"
-                else:
-                    href = row["name"]
-                cards.append(_card_html(row, href, site['color']))
-            site_html.append(
-                f'<section class="site"><h3 style="color:{site["color"]}">{html.escape(site["host"])}'
-                f' <small>{len(site["rows"])} 个</small></h3><div class="grid">{"".join(cards)}</div></section>'
+                href = row["name"] if current_folder or not day["folder"] else f"{day['folder']}/{row['name']}"
+                cards.append(_card_html(row, href, site["color"]))
+            blocks.append(
+                f'<section class="site"><h2><i style="background:{site["color"]}"></i>{html.escape(site["host"])}'
+                f'<small>{len(site["rows"])} 个作品</small></h2>'
+                f'<div class="track">{"".join(cards)}</div></section>'
             )
-        anchor = "loose" if not day["folder"] else day["label"]
-        sections.append(
-            f'<section class="day" id="{html.escape(anchor)}"><h2>{html.escape(day["label"])}</h2>{"".join(site_html) or "<p>这一天还没有样本。</p>"}</section>'
-        )
-    body = "".join(sections) or "<p class='empty'>还没有样本。跑一次路线提示词测试后，回到这里刷新。</p>"
-    home = f'<a href="{html.escape(home_href)}">全局对比</a>' if home_href else ""
+        if blocks:
+            anchor = "loose" if not day["folder"] else day["label"]
+            sections.append(f'<section class="day" id="{html.escape(anchor)}"><h1>{html.escape(day["label"])}</h1>{"".join(blocks)}</section>')
+    body = "".join(sections) or '<p class="empty">还没有样本。跑一次路线提示词测试后，回到这里刷新。</p>'
+    home = f'<a class="chip" href="{html.escape(home_href)}">全局对比</a>' if home_href else ""
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -157,55 +160,60 @@ def _page(title, days, home_href, current_folder):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
 <style>
-body {{ margin: 0; background: #121212; color: #f3f3f3; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }}
-.top {{ position: sticky; top: 0; z-index: 8; background: #1c1c1c; border-bottom: 1px solid #333; padding: 10px 16px 12px; }}
-.top h1 {{ margin: 0 0 6px; font-size: 20px; }}
-.top p {{ margin: 0 0 8px; color: #bbb; font-size: 13px; }}
-.links a, .hosts button, .tools button {{ display: inline-block; margin: 3px 6px 3px 0; padding: 4px 8px; color: #fff; background: #2a2a2a; border: 1px solid #555; border-radius: 6px; text-decoration: none; cursor: pointer; }}
-.day {{ padding: 8px 16px 28px; }}
-.day h2 {{ margin: 18px 0 8px; font-size: 28px; }}
-.site h3 {{ margin: 14px 0 8px; font-size: 22px; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(640px, 1fr)); gap: 16px; }}
-.card {{ background: #1a1a1a; border: 4px solid var(--site, #444); border-radius: 12px; overflow: hidden; }}
-.card header {{ display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: baseline; padding: 10px 12px; }}
-.card header strong {{ font-size: 22px; }}
-.card header span, .card header em {{ color: #c8c8c8; font-style: normal; }}
-.card header a, .card header button {{ color: #9ad; background: transparent; border: 0; cursor: pointer; font: inherit; }}
-.frame-wrap {{ position: relative; height: 68vh; min-height: 520px; background: #fff; }}
-.frame-wrap iframe {{ width: 100%; height: 100%; border: 0; background: #fff; pointer-events: none; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: #f6f7fb; color: #1f2329; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }}
+.top {{ position: sticky; top: 0; z-index: 9; background: rgba(255,255,255,.94); backdrop-filter: blur(8px); border-bottom: 1px solid #e5e7eb; padding: 18px 28px 14px; }}
+.top h1 {{ margin: 0; font-size: 30px; letter-spacing: 1px; }}
+.top h1 b {{ color: #ff7d29; }}
+.top p {{ margin: 8px 0 12px; color: #6b7280; font-size: 14px; }}
+.chips {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+.chip {{ display: inline-flex; gap: 6px; align-items: center; padding: 6px 14px; border: 1px solid #d8dbe3; border-radius: 999px; background: #fff; color: #374151; text-decoration: none; font-size: 13px; cursor: pointer; }}
+.chip b {{ color: #9ca3af; font-weight: 500; }}
+.chip:hover {{ border-color: #ff7d29; color: #ff7d29; }}
+.chip.active {{ background: #1f2329; border-color: #1f2329; color: #fff; }}
+.chip.active b {{ color: #bbb; }}
+.host-chip::before {{ content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dot, #ccc); }}
+.stats {{ display: flex; gap: 26px; margin-top: 14px; }}
+.stats div {{ font-size: 13px; color: #6b7280; }}
+.stats strong {{ display: block; font-size: 22px; color: #1f2329; }}
+main {{ padding: 8px 28px 48px; max-width: 1600px; }}
+.day h1 {{ margin: 26px 0 6px; font-size: 26px; }}
+.site h2 {{ display: flex; gap: 10px; align-items: center; margin: 20px 0 12px; font-size: 19px; }}
+.site h2 i {{ width: 10px; height: 10px; border-radius: 50%; }}
+.site h2 small {{ color: #9ca3af; font-weight: 400; font-size: 13px; }}
+.track {{ display: flex; gap: 18px; overflow-x: auto; padding: 2px 2px 14px; scroll-snap-type: x proximity; }}
+.track::-webkit-scrollbar {{ height: 8px; }}
+.track::-webkit-scrollbar-thumb {{ background: #d4d7de; border-radius: 4px; }}
+.card {{ flex: 0 0 340px; scroll-snap-align: start; background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; overflow: hidden; box-shadow: 0 2px 10px rgba(15,23,42,.05); }}
+.card:hover {{ box-shadow: 0 8px 24px rgba(15,23,42,.12); }}
+.frame {{ position: relative; display: block; height: 300px; background: #fff; }}
+.frame iframe {{ width: 100%; height: 100%; border: 0; background: #fff; pointer-events: none; }}
 .overlay {{ position: absolute; inset: 0; }}
-.frame-wrap.live iframe {{ pointer-events: auto; }}
-.frame-wrap.live .overlay {{ display: none; }}
-body.compact .frame-wrap {{ height: 340px; min-height: 260px; }}
-body.compact .grid {{ grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }}
+.info {{ padding: 12px 14px 14px; border-top: 1px solid #f0f1f4; }}
+.row1 {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; }}
+.row1 strong {{ font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.row1 a {{ color: #ff7d29; font-size: 12px; text-decoration: none; }}
+.meta {{ display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 8px; }}
+.meta-item {{ font-size: 12px; color: #4b5563; }}
+.meta-item em {{ font-style: normal; color: #9ca3af; margin-right: 3px; }}
 .hidden {{ display: none !important; }}
-.empty {{ padding: 24px; }}
+.empty {{ padding: 40px; color: #6b7280; }}
 </style>
 </head>
 <body>
 <div class="top">
-  <h1>{html.escape(title)}</h1>
-  <p>同一站点的动画放在一起。默认滚轮只滚外层，方便连续看哪个站更好。卡片默认大图；样本很多时再切紧凑。</p>
-  <div class="tools">
-    {home}
-    <button type="button" id="size-btn">切换紧凑图</button>
-  </div>
-  <div class="links">{''.join(day_links)}</div>
-  <div class="hosts">{''.join(host_buttons)}</div>
+  <h1>鹈鹕<b>测智</b></h1>
+  <p>同一个提示词，投喂给不同的模型站点，看看谁真的会画鹈鹕骑自行车。</p>
+  <div class="stats"><div><strong>{total}</strong>作品</div><div><strong>{site_count}</strong>站点</div><div><strong>{len(days)}</strong>日期</div></div>
+  <div class="chips">{home}{chips}{day_chips}</div>
 </div>
-{body}
+<main>{body}</main>
 <script>
-const sizeBtn = document.getElementById("size-btn");
-function applySize(compact) {{
-  document.body.classList.toggle("compact", compact);
-  sizeBtn.textContent = compact ? "切换大图" : "切换紧凑图";
-  localStorage.setItem("prompt-gallery-size", compact ? "compact" : "large");
-}}
-applySize(localStorage.getItem("prompt-gallery-size") === "compact");
-sizeBtn.onclick = () => applySize(!document.body.classList.contains("compact"));
-document.querySelectorAll(".hosts button").forEach((button) => {{
-  button.onclick = () => {{
-    const host = button.dataset.host;
+const chips = document.querySelectorAll(".host-chip");
+chips.forEach((chip) => {{
+  chip.onclick = () => {{
+    const host = chip.dataset.host;
+    chips.forEach((item) => item.classList.toggle("active", item === chip));
     document.querySelectorAll(".card").forEach((card) => {{
       card.classList.toggle("hidden", Boolean(host) && card.dataset.host !== host);
     }});
@@ -213,13 +221,6 @@ document.querySelectorAll(".hosts button").forEach((button) => {{
       const visible = site.querySelector(".card:not(.hidden)");
       site.classList.toggle("hidden", !visible);
     }});
-  }};
-}});
-document.querySelectorAll(".live-btn").forEach((button) => {{
-  button.onclick = () => {{
-    const wrap = button.closest(".card").querySelector(".frame-wrap");
-    wrap.classList.toggle("live");
-    button.textContent = wrap.classList.contains("live") ? "恢复外层滚动" : "允许卡片内交互";
   }};
 }});
 </script>
