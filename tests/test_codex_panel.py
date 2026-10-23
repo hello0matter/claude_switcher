@@ -684,14 +684,30 @@ class CodexPanelCoreTests(unittest.TestCase):
             "https://api.example/v1/responses",
         )
 
-    def test_write_config_rejects_unsupported_wire_api(self):
+    def test_write_config_keeps_address_and_omits_non_responses_wire_api(self):
         route = codex_panel._normalise_route({
             "name": "Legacy Chat",
             "provider_id": "legacy",
-            "wire_api": "chat",
+            "base_url": "https://relay.example/v1/chat/completions",
+            "wire_api": "（不追加）",
         })
-        with self.assertRaisesRegex(ValueError, "仅支持 wire API：responses"):
-            codex_panel._write_codex_config(route)
+        self.assertEqual(route["base_url"], "https://relay.example/v1/chat/completions")
+        self.assertEqual(route["wire_api"], "")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.toml"
+            config.write_text(
+                '[model_providers.legacy]\nwire_api = "responses"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.object(codex_panel, "CODEX_HOME", root), mock.patch.object(
+                codex_panel, "CODEX_CONFIG_FILE", config
+            ):
+                codex_panel._write_codex_config(route)
+            parsed = codex_panel.tomllib.loads(config.read_text(encoding="utf-8"))
+        provider = parsed["model_providers"]["legacy"]
+        self.assertEqual(provider["base_url"], "https://relay.example/v1/chat/completions")
+        self.assertNotIn("wire_api", provider)
 
 
 if __name__ == "__main__":

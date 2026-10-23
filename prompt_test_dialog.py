@@ -139,7 +139,7 @@ class PromptTestDialog(tk.Toplevel):
                     route.get("name") or "未命名",
                     route.get("model") or "(无模型)",
                     route.get("reasoning_effort") or "默认",
-                    prompt_probe.LOCKED_WIRE_API,
+                    prompt_probe.wire_suffix_label(route.get('wire_api')),
                     "等待",
                     "",
                 ),
@@ -228,8 +228,8 @@ class PromptTestDialog(tk.Toplevel):
 
     def _run_one(self, row):
         route = dict(row["route"])
-        route["wire_api"] = prompt_probe.LOCKED_WIRE_API
-        route["base_url"], _kind = prompt_probe.strip_manual_wire_suffix(route.get("base_url"))
+        route["wire_api"] = prompt_probe.normalize_wire_suffix(route.get("wire_api"), default="/responses")
+        route["base_url"] = str(route.get("base_url") or "").strip().rstrip("/")
         problem = prompt_probe.provider_id_problem(route)
         if problem:
             self._finish_row(row, "已跳过", "", problem)
@@ -348,7 +348,7 @@ class PromptTestDialog(tk.Toplevel):
                     route.get("name") or "未命名",
                     route.get("model") or "",
                     route.get("reasoning_effort") or "默认",
-                    prompt_probe.LOCKED_WIRE_API,
+                    prompt_probe.wire_suffix_label(route.get('wire_api')),
                     status,
                     path,
                 ),

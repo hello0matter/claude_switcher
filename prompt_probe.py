@@ -14,10 +14,27 @@ from pathlib import Path
 
 
 PROMPT_SETTINGS_FILE = Path.home() / ".claude_switcher_prompt.json"
-LOCKED_WIRE_API = "responses"
-WIRE_SUFFIX = "/responses"
+WIRE_SUFFIX_EMPTY = "（不追加）"
+WIRE_SUFFIX_CHOICES = (
+    WIRE_SUFFIX_EMPTY,
+    "/responses",
+    "/chat/completions",
+    "/completions",
+    "/v1/responses",
+    "/v1/chat/completions",
+    "/v1/messages",
+)
+_WIRE_ALIASES = {
+    "": "",
+    WIRE_SUFFIX_EMPTY: "",
+    "(不追加)": "",
+    "none": "",
+    "responses": "/responses",
+    "chat": "/chat/completions",
+    "completions": "/completions",
+    "messages": "/v1/messages",
+}
 _PROVIDER_ID = re.compile(r"^[A-Za-z0-9_-]+$")
-_TRADITIONAL_SUFFIXES = ("/chat/completions", "/completions")
 _FILENAME_TOKEN = re.compile(r"[^A-Za-z0-9._-]+")
 
 DEFAULT_OUTPUT_DIR = (
@@ -74,25 +91,58 @@ def save_prompt_settings(settings):
     return payload
 
 
-def strip_manual_wire_suffix(base_url):
-    """Return (url, kind). kind is traditional, responses, or empty."""
-    text = str(base_url or "").strip().rstrip("/")
+def normalize_wire_suffix(value, default="/responses"):
+    """Return the path appended to the API address. Empty means append nothing."""
+    if value is None:
+        value = default
+    text = str(value).strip()
+    if text in _WIRE_ALIASES:
+        return _WIRE_ALIASES[text]
     lowered = text.lower()
-    for suffix in _TRADITIONAL_SUFFIXES:
-        if lowered.endswith(suffix):
-            return text[: -len(suffix)].rstrip("/"), "traditional"
-    if lowered.endswith(WIRE_SUFFIX):
-        return text[: -len(WIRE_SUFFIX)].rstrip("/"), "responses"
-    return text, ""
+    if lowered in _WIRE_ALIASES:
+        return _WIRE_ALIASES[lowered]
+    if not text:
+        return ""
+    if not text.startswith("/"):
+        text = "/" + text
+    return text[:-1] if text.endswith("/") and len(text) > 1 else text
+
+
+def wire_suffix_label(value):
+    suffix = normalize_wire_suffix(value, default="")
+    return suffix or WIRE_SUFFIX_EMPTY
+
+
+def join_api_url(base_url, suffix):
+    """Append the selected suffix only. Never rewrite or strip the API address."""
+    base = str(base_url or "").strip().rstrip("/")
+    path = normalize_wire_suffix(suffix, default="")
+    if not path:
+        return base
+    return base + path
+
+
+def request_url_for_route(route):
+    if "wire_api" not in route:
+        suffix = "/responses"
+    else:
+        suffix = normalize_wire_suffix(route.get("wire_api"), default="")
+    return join_api_url(route.get("base_url"), suffix)
+
+
+def codex_config_wire_api(value):
+    """Codex CLI only accepts wire_api=responses. Other suffixes stay out of config.toml."""
+    suffix = normalize_wire_suffix(value, default="")
+    if suffix in {"/responses", "/v1/responses"}:
+        return "responses"
+    return None
 
 
 def prepare_route_form(values):
-    """Editor save path: suffix is appended by Codex, never chosen by hand."""
+    """Keep the API address exactly as entered, aside from a trailing slash."""
     prepared = dict(values)
-    base_url, kind = strip_manual_wire_suffix(prepared.get("base_url", ""))
-    prepared["base_url"] = base_url
-    prepared["wire_api"] = LOCKED_WIRE_API
-    prepared["wire_suffix_kind"] = kind
+    prepared["base_url"] = str(prepared.get("base_url") or "").strip().rstrip("/")
+    prepared["wire_api"] = normalize_wire_suffix(prepared.get("wire_api"), default="")
     return prepared
 
 
@@ -126,7 +176,7 @@ def prompt_filename(route, when=None):
     host = _file_token(non_subdomain_host(route.get("base_url")), "nohost", 48)
     model = _file_token(route.get("model"), "nomodel", 48)
     effort = _file_token(route.get("reasoning_effort"), "default", 16)
-    wire = _file_token(route.get("wire_api") or LOCKED_WIRE_API, LOCKED_WIRE_API, 16)
+    wire = _file_token(wire_suffix_label(route.get("wire_api")), "none", 32)
     return f"{stamp}_{host}_{model}_{effort}_{wire}.html"
 
 
@@ -151,7 +201,7 @@ def render_prompt(template, route, output_path):
         "filename": output_path.name,
         "model": str(route.get("model") or ""),
         "effort": str(route.get("reasoning_effort") or "默认"),
-        "wire": LOCKED_WIRE_API,
+        "wire": wire_suffix_label(route.get("wire_api")),
         "api_host": non_subdomain_host(route.get("base_url")),
         "route_name": str(route.get("name") or ""),
         "base_url": str(route.get("base_url") or ""),
@@ -178,17 +228,13 @@ def config_override_args(route):
     provider_id = str(route.get("provider_id") or "").strip()
     args = ["-c", f"model_provider={json.dumps(provider_id, ensure_ascii=False)}"]
     prefix = f"model_providers.{provider_id}"
-    base_url, _kind = strip_manual_wire_suffix(route.get("base_url"))
+    base_url = str(route.get("base_url") or "").strip().rstrip("/")
     if base_url:
         args.extend(["-c", f"{prefix}.base_url={json.dumps(base_url, ensure_ascii=False)}"])
-    args.extend(
-        [
-            "-c",
-            f"{prefix}.wire_api={json.dumps(LOCKED_WIRE_API)}",
-            "-c",
-            f"{prefix}.requires_openai_auth=false",
-        ]
-    )
+    codex_wire = codex_config_wire_api(route.get("wire_api"))
+    if codex_wire:
+        args.extend(["-c", f"{prefix}.wire_api={json.dumps(codex_wire)}"])
+    args.extend(["-c", f"{prefix}.requires_openai_auth=false"])
     if route.get("name"):
         args.extend(["-c", f"{prefix}.name={json.dumps(str(route['name']), ensure_ascii=False)}"])
     api_key = str(route.get("api_key") or "")

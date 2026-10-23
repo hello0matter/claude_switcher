@@ -125,7 +125,7 @@ def _normalise_route(route):
         result["disable_response_storage"] = str(storage).strip().lower() == "true"
     else:
         result["disable_response_storage"] = None
-    result["wire_api"] = str(result.get("wire_api") or "responses").strip()
+    result["wire_api"] = prompt_probe.normalize_wire_suffix(result.get("wire_api"), default="/responses")
     models = result.get("models", [])
     if isinstance(models, str):
         models = [item.strip() for item in models.split(",") if item.strip()]
@@ -212,11 +212,10 @@ def _backup_file(path):
 
 def _write_codex_config(route):
     route = dict(route)
-    route["base_url"], _suffix_kind = prompt_probe.strip_manual_wire_suffix(route.get("base_url"))
+    route["base_url"] = str(route.get("base_url") or "").strip().rstrip("/")
+    route["wire_api"] = prompt_probe.normalize_wire_suffix(route.get("wire_api"), default="/responses")
     if tomlkit is None:
         raise RuntimeError("缺少 tomlkit，无法安全写入 config.toml。请运行：python -m pip install tomlkit")
-    if route["wire_api"] != "responses":
-        raise ValueError("当前 Codex 仅支持 wire API：responses")
     CODEX_HOME.mkdir(parents=True, exist_ok=True)
     original = CODEX_CONFIG_FILE.read_text(encoding="utf-8") if CODEX_CONFIG_FILE.exists() else ""
     document = tomlkit.parse(original) if original.strip() else tomlkit.document()
@@ -248,7 +247,11 @@ def _write_codex_config(route):
         provider["base_url"] = route["base_url"]
     elif "base_url" in provider:
         del provider["base_url"]
-    provider["wire_api"] = route["wire_api"]
+    codex_wire = prompt_probe.codex_config_wire_api(route.get("wire_api"))
+    if codex_wire:
+        provider["wire_api"] = codex_wire
+    elif "wire_api" in provider:
+        del provider["wire_api"]
     provider["requires_openai_auth"] = False
     if route["api_key"]:
         provider["experimental_bearer_token"] = route["api_key"]
@@ -974,15 +977,13 @@ def test_codex_model(route, model, timeout=30):
     }
     if route.get("api_key"):
         headers["Authorization"] = "Bearer " + route["api_key"]
-    wire_api = route.get("wire_api", "responses")
-    if wire_api == "chat":
-        endpoint = "chat/completions"
+    request_url = prompt_probe.request_url_for_route(route)
+    lowered_url = request_url.lower()
+    if lowered_url.endswith("/chat/completions") or lowered_url.endswith("/messages"):
         payload = {"model": model, "messages": [{"role": "user", "content": "Reply with OK."}], "max_tokens": 16}
-    elif wire_api == "completions":
-        endpoint = "completions"
+    elif lowered_url.endswith("/completions"):
         payload = {"model": model, "prompt": "Reply with OK.", "max_tokens": 16}
     else:
-        endpoint = "responses"
         # Match Codex's streaming request shape. Some Responses gateways reject
         # max_output_tokens on this lightweight probe even though Codex itself
         # works with the model.
@@ -993,7 +994,7 @@ def test_codex_model(route, model, timeout=30):
             "store": False,
         }
     body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(_openai_url(route.get("base_url"), endpoint), data=body, headers=headers, method="POST")
+    request = urllib.request.Request(request_url, data=body, headers=headers, method="POST")
     started = time.perf_counter()
     try:
         with open_app_request(request, timeout=timeout) as response:
@@ -1110,11 +1111,12 @@ def check_codex_route_integrity(route, timeout=45):
             "details": ["请先给路线设置一个可用模型。"],
             "latency_ms": "",
         }
-    if route.get("wire_api", "responses") != "responses":
+    request_url = prompt_probe.request_url_for_route(route)
+    if not request_url.rstrip("/").lower().endswith("/responses"):
         return {
-            "verdict": "inconclusive",
-            "summary": "无法检测：只支持 Responses API 路线",
-            "details": ["当前路线不是 Responses API。"],
+            "verdict": "skipped",
+            "summary": "未做 Responses 验证码检测；API 地址按原样使用，只追加所选后缀",
+            "details": [f"实际请求地址：{request_url or '(空)'}"],
             "latency_ms": "",
         }
 
@@ -1149,7 +1151,6 @@ def check_codex_route_integrity(route, timeout=45):
     }
     if route.get("api_key"):
         headers["Authorization"] = "Bearer " + route["api_key"]
-    request_url = _openai_url(route.get("base_url"), "responses")
     request = urllib.request.Request(
         request_url,
         data=json.dumps(payload).encode("utf-8"),
@@ -1263,6 +1264,9 @@ def check_codex_route_anomaly(route, timeout=45):
         result = dict(result)
         result["verdict"] = "normal"
         result["summary"] = "路线暂时正常"
+    elif result["verdict"] == "skipped":
+        result = dict(result)
+        result["verdict"] = "normal"
     else:
         original_verdict = result["verdict"]
         result = dict(result)
@@ -1321,8 +1325,13 @@ class CodexRouteEditor(tk.Toplevel):
                     state="readonly",
                 )
             elif key == "wire_api":
-                var.set("/responses")
-                entry = tk.Entry(self, textvariable=var, width=43, state="disabled")
+                var.set(prompt_probe.wire_suffix_label(route.get("wire_api")))
+                entry = ttk.Combobox(
+                    self,
+                    textvariable=var,
+                    width=40,
+                    values=prompt_probe.WIRE_SUFFIX_CHOICES,
+                )
             else:
                 entry = tk.Entry(self, textvariable=var, width=43, show="*" if key == "api_key" else "")
             entry.grid(row=row, column=1, padx=4, pady=5)
@@ -1331,9 +1340,7 @@ class CodexRouteEditor(tk.Toplevel):
                 self.key_entry = entry
                 tk.Button(self, text="显示", width=5, command=self._toggle_key).grid(row=row, column=2, padx=(0, 8))
         self._key_visible = False
-        hint = "固定追加在 API 地址末尾，不能手改，也不提供传统 chat/completions 模式。"
-        if str(route.get("wire_api") or "") not in ("", "responses"):
-            hint = "这条路线原来不是 responses。保存时会固定为 /responses，不能选传统模式。"
+        hint = "这是追加在 API 地址末尾的路径，也可以自己填。API 地址按原样保存，不会自动删后缀。选（不追加）就是什么也不加。"
         tk.Label(self, text=hint, fg="#8a5a00", wraplength=430, justify="left").grid(
             row=len(fields), column=0, columnspan=3, padx=12, pady=(0, 4), sticky="w"
         )
@@ -1354,12 +1361,6 @@ class CodexRouteEditor(tk.Toplevel):
             messagebox.showwarning("提示", "名称和 provider ID 不能为空", parent=self)
             return
         values = prompt_probe.prepare_route_form(values)
-        if values.pop("wire_suffix_kind") == "traditional":
-            messagebox.showwarning(
-                "不支持传统模式",
-                "API 地址末尾的传统模式路径已去掉。软件只会固定追加 /responses，不能手改，也不能改成 chat/completions。",
-                parent=self,
-            )
         values["models"] = [item.strip() for item in values["models"].split(",") if item.strip()]
         storage = values["disable_response_storage"].lower()
         values["disable_response_storage"] = {
@@ -1707,7 +1708,7 @@ class CodexPanel(tk.Frame):
         route = self.routes[index]
         for key in ("name", "provider_id", "base_url", "model", "reasoning_effort", "wire_api", "note"):
             self.detail_vars[key].set(route.get(key) or "(未设置)")
-        self.detail_vars["wire_api"].set("/responses（固定追加，不可改，无传统模式）")
+        self.detail_vars["wire_api"].set(prompt_probe.wire_suffix_label(route.get("wire_api")))
         storage = route.get("disable_response_storage")
         self.detail_vars["disable_response_storage"].set("默认" if storage is None else str(storage).lower())
         self.detail_vars["api_key"].set(_mask_secret(route.get("api_key")))
@@ -1881,8 +1882,7 @@ class CodexPanel(tk.Frame):
         settings = prompt_probe.load_prompt_settings()
         directory = Path(settings["output_dir"])
         cleaned = dict(route)
-        cleaned["base_url"], suffix_kind = prompt_probe.strip_manual_wire_suffix(route.get("base_url"))
-        cleaned["wire_api"] = prompt_probe.LOCKED_WIRE_API
+        cleaned["wire_api"] = prompt_probe.normalize_wire_suffix(route.get("wire_api"), default="/responses")
         try:
             output_path = prompt_gallery.allocate_prompt_output(directory, cleaned)
             prompt_gallery.refresh_galleries(directory)
@@ -1893,8 +1893,6 @@ class CodexPanel(tk.Frame):
         notes = []
         if len(self.selected_indices()) > 1:
             notes.append("当前多选了多条路线，这次只会启动高亮的那一条。批量请用“路线提示词测试”。")
-        if suffix_kind == "traditional":
-            notes.append("API 地址里的传统模式后缀会去掉，固定追加 /responses。")
         if not cleaned.get("model"):
             notes.append("这条路线没有模型名，文件名会用 nomodel，Codex 可能使用配置里的默认模型。")
         if prompt_probe.prompt_mentions_git_publish(prompt):
@@ -1994,10 +1992,7 @@ class CodexPanel(tk.Frame):
         BenchmarkDialog(self, entries)
 
     def _probe_route(self, route, runner):
-        cleaned = dict(route)
-        cleaned["base_url"], _kind = prompt_probe.strip_manual_wire_suffix(route.get("base_url"))
-        cleaned["wire_api"] = prompt_probe.LOCKED_WIRE_API
-        return runner(cleaned)
+        return runner(dict(route))
 
     def check_selected_route_integrity(self):
         indexes = self.selected_indices()

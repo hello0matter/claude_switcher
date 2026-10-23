@@ -29,21 +29,26 @@ class PromptProbeTests(unittest.TestCase):
             "20261023-153045_xiaomimimo.com_mimo-v2.6-pro_medium_responses.html",
         )
 
-    def test_prepare_route_form_locks_responses_and_strips_traditional_suffix(self):
+    def test_prepare_route_form_keeps_api_address_and_selected_suffix(self):
         prepared = prompt_probe.prepare_route_form(
             {
-                "base_url": "https://api.example.com/v1/chat/completions",
+                "base_url": "https://api.example.com/v1/chat/completions/",
                 "wire_api": "chat",
             }
         )
-        self.assertEqual(prepared["base_url"], "https://api.example.com/v1")
-        self.assertEqual(prepared["wire_api"], "responses")
-        self.assertEqual(prepared["wire_suffix_kind"], "traditional")
+        self.assertEqual(prepared["base_url"], "https://api.example.com/v1/chat/completions")
+        self.assertEqual(prepared["wire_api"], "/chat/completions")
 
-    def test_responses_suffix_is_stripped_but_not_called_traditional(self):
-        base_url, kind = prompt_probe.strip_manual_wire_suffix("https://api.example/v1/responses")
-        self.assertEqual(base_url, "https://api.example/v1")
-        self.assertEqual(kind, "responses")
+    def test_empty_suffix_appends_nothing_and_does_not_strip_address(self):
+        self.assertEqual(
+            prompt_probe.join_api_url("https://api.example/v1/responses", ""),
+            "https://api.example/v1/responses",
+        )
+        self.assertEqual(
+            prompt_probe.join_api_url("https://api.example/v1", "/chat/completions"),
+            "https://api.example/v1/chat/completions",
+        )
+        self.assertEqual(prompt_probe.normalize_wire_suffix("（不追加）", default="/responses"), "")
 
     def test_render_prompt_fills_path_and_default_forbids_publish(self):
         route = {"name": "xiaomi", "model": "mimo", "base_url": "https://api.xiaomimimo.com/v1"}
@@ -68,9 +73,8 @@ class PromptProbeTests(unittest.TestCase):
             }
         )
         joined = " ".join(args)
-        self.assertIn('model_providers.mc.wire_api="responses"', joined)
-        self.assertIn('model_providers.mc.base_url="https://api.example/v1"', joined)
-        self.assertNotIn("chat", joined)
+        self.assertNotIn("wire_api=", joined)
+        self.assertIn('model_providers.mc.base_url="https://api.example/v1/responses"', joined)
         self.assertIn("secret", joined)
 
     def test_unsafe_provider_id_is_rejected_for_batch(self):
