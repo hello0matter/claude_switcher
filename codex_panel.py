@@ -28,6 +28,7 @@ from tkinter import messagebox, simpledialog, ttk
 from app_network import describe_network_error, open_app_request
 from benchmark_dialog import BenchmarkDialog
 from cost_comparison import CostComparisonDialog
+import prompt_gallery
 import prompt_probe
 from prompt_test_dialog import PromptSettingsDialog, PromptTestDialog
 from route_batch_dialog import RouteBatchDialog
@@ -1879,15 +1880,15 @@ class CodexPanel(tk.Frame):
     def _prepare_launch_prompt(self, route):
         settings = prompt_probe.load_prompt_settings()
         directory = Path(settings["output_dir"])
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            messagebox.showerror("输出目录不可用", str(exc), parent=self)
-            return None
         cleaned = dict(route)
         cleaned["base_url"], suffix_kind = prompt_probe.strip_manual_wire_suffix(route.get("base_url"))
         cleaned["wire_api"] = prompt_probe.LOCKED_WIRE_API
-        output_path = prompt_probe.unique_output_path(directory, prompt_probe.prompt_filename(cleaned))
+        try:
+            output_path = prompt_gallery.allocate_prompt_output(directory, cleaned)
+            prompt_gallery.refresh_galleries(directory)
+        except OSError as exc:
+            messagebox.showerror("输出目录不可用", str(exc), parent=self)
+            return None
         prompt = prompt_probe.render_prompt(settings["prompt"], cleaned, output_path)
         notes = []
         if len(self.selected_indices()) > 1:
@@ -1899,7 +1900,7 @@ class CodexPanel(tk.Frame):
         if prompt_probe.prompt_mentions_git_publish(prompt):
             notes.append("提示词包含提交或推送，模型可能会改 git 仓库。")
         message = (
-            f"将启动并让模型写文件：\n{output_path}\n\n"
+            f"将启动并让模型写文件：\n{output_path}\n对比页：{directory / 'index.html'}\n\n"
             f"路线：{route.get('name')}\n"
             f"模型：{route.get('model') or '(未设置)'}\n"
             f"强度：{route.get('reasoning_effort') or '默认'}\n"
@@ -1909,7 +1910,7 @@ class CodexPanel(tk.Frame):
         )
         if not messagebox.askyesno("启动并执行提示词测试", message, parent=self):
             return None
-        return prompt, directory
+        return prompt, output_path.parent
 
     def open_prompt_test(self):
         indexes = self.selected_indices()

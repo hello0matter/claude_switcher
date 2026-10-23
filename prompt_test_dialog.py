@@ -7,6 +7,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
+import prompt_gallery
 import prompt_probe
 
 
@@ -101,6 +102,7 @@ class PromptTestDialog(tk.Toplevel):
         tk.Button(bar, text="停止", command=self.stop).pack(side="left", padx=2)
         tk.Button(bar, text="编辑提示词", command=self.edit_prompt).pack(side="left", padx=2)
         tk.Button(bar, text="打开输出目录", command=self.open_dir).pack(side="left", padx=2)
+        tk.Button(bar, text="打开对比页", command=self.open_gallery).pack(side="left", padx=2)
         self.status_var = tk.StringVar(value=f"已选 {len(self.routes)} 条。开始后按顺序跑，结果都列在这个窗口里。")
         tk.Label(self, textvariable=self.status_var, anchor="w", justify="left", wraplength=940).pack(fill="x", padx=10)
 
@@ -151,16 +153,31 @@ class PromptTestDialog(tk.Toplevel):
             return
         PromptSettingsDialog(self)
 
+    def _output_root(self):
+        return Path(prompt_probe.load_prompt_settings()["output_dir"])
+
     def open_dir(self):
-        directory = prompt_probe.load_prompt_settings()["output_dir"]
+        self._open_path(self._output_root(), "打不开目录")
+
+    def open_gallery(self):
         try:
-            Path(directory).mkdir(parents=True, exist_ok=True)
-            if os.name == "nt":
-                os.startfile(directory)  # noqa: S606 - user asked to open the output folder
-            else:
-                subprocess.Popen(["xdg-open", directory])
+            page = prompt_gallery.refresh_galleries(self._output_root())
         except OSError as exc:
-            messagebox.showerror("打不开目录", str(exc), parent=self)
+            messagebox.showerror("打不开对比页", str(exc), parent=self)
+            return
+        self._open_path(page, "打不开对比页")
+
+    def _open_path(self, path, title):
+        try:
+            path = Path(path)
+            if path.suffix.lower() != ".html":
+                path.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(path)  # noqa: S606 - user asked to open the comparison page
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except OSError as exc:
+            messagebox.showerror(title, str(exc), parent=self)
 
     def start(self):
         if self._running:
@@ -223,17 +240,14 @@ class PromptTestDialog(tk.Toplevel):
         settings = prompt_probe.load_prompt_settings()
         directory = Path(settings["output_dir"])
         try:
-            directory.mkdir(parents=True, exist_ok=True)
+            output_path = prompt_gallery.allocate_prompt_output(directory, route)
         except OSError as exc:
             self._finish_row(row, "失败", "", f"无法创建输出目录：{exc}")
             return
-        output_path = prompt_probe.unique_output_path(
-            directory, prompt_probe.prompt_filename(route)
-        )
         prompt = prompt_probe.render_prompt(settings["prompt"], route, output_path)
         hidden = bool(self.hidden_var.get())
         try:
-            command = self.command_builder(self.binary_var.get(), route, prompt, directory, hidden)
+            command = self.command_builder(self.binary_var.get(), route, prompt, output_path.parent, hidden)
         except Exception as exc:
             self._finish_row(row, "失败", str(output_path), str(exc))
             return
@@ -257,6 +271,10 @@ class PromptTestDialog(tk.Toplevel):
         else:
             status = f"失败（退出码 {code}）"
         detail = self._public_detail(prompt, output_path, output, code)
+        try:
+            prompt_gallery.refresh_galleries(directory)
+        except OSError:
+            pass
         self._finish_row(row, status, str(output_path), detail)
 
     def _popen_kwargs(self, hidden):
@@ -347,7 +365,7 @@ class PromptTestDialog(tk.Toplevel):
     def _finish(self):
         self._running = False
         if self.winfo_exists() and not self._stop:
-            self.status_var.set("本轮结束。点一行可看输出摘要，不会再弹每个路线的结果窗。")
+            self.status_var.set("本轮结束。对比页已按天更新，点“打开对比页”用滚轮看哪个站点更好。")
 
     def _show_selected(self):
         selected = self.tree.selection()
