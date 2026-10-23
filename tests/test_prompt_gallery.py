@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -44,9 +45,35 @@ class PromptGalleryTests(unittest.TestCase):
         self.assertIn("未按天归档", global_html)
         self.assertIn('class="track"', global_html)
         self.assertIn("鹈鹕", global_html)
+        self.assertIn("--card-w: 220px", global_html)
+        self.assertIn('id="size"', global_html)
+        self.assertIn('data-host=""', global_html)
+        self.assertIn("预览大小", global_html)
         self.assertIn('src="20261023-153045_xiaomimimo.com_mimo_medium_responses.html"', day_html)
         self.assertIn("../index.html", day_html)
         self.assertNotIn("old.html", day_html)
+
+    def test_served_gallery_rereads_the_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            day = root / "2026-10-23"
+            day.mkdir()
+            (day / "20261023-153045_xiaomimimo.com_mimo_medium_responses.html").write_text(
+                "<html><body>first</body></html>", encoding="utf-8"
+            )
+            url = prompt_gallery.serve_gallery(root)
+            try:
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    first = response.read().decode("utf-8")
+                new_name = "20261023-160000_okai.la_newmodel_high_responses.html"
+                (day / new_name).write_text("<html><body>second</body></html>", encoding="utf-8")
+                with urllib.request.urlopen(url + "?v=2", timeout=5) as response:
+                    second = response.read().decode("utf-8")
+            finally:
+                prompt_gallery.shutdown_gallery_servers()
+        self.assertNotIn(new_name, first)
+        self.assertIn(new_name, second)
+        self.assertIn('class="track"', second)
 
 
 if __name__ == "__main__":

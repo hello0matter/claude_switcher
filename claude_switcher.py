@@ -1922,5 +1922,12 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    try:
+        import prompt_gallery
+        import prompt_probe
+
+        prompt_gallery.refresh_galleries(prompt_probe.load_prompt_settings()["output_dir"])
+    except Exception:
+        pass
     app = App()
     app.mainloop()

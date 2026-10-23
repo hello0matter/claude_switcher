@@ -3,7 +3,9 @@
 import os
 import subprocess
 import threading
+import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
@@ -160,12 +162,14 @@ class PromptTestDialog(tk.Toplevel):
         self._open_path(self._output_root(), "打不开目录")
 
     def open_gallery(self):
+        root = self._output_root()
         try:
-            page = prompt_gallery.refresh_galleries(self._output_root())
+            url = prompt_gallery.serve_gallery(root)
         except OSError as exc:
             messagebox.showerror("打不开对比页", str(exc), parent=self)
             return
-        self._open_path(page, "打不开对比页")
+        if not webbrowser.open(url):
+            self._open_path(root / "index.html", "打不开对比页")
 
     def _open_path(self, path, title):
         try:
@@ -258,7 +262,7 @@ class PromptTestDialog(tk.Toplevel):
             self._finish_row(row, "失败", str(output_path), str(exc))
             return
         self._process = process
-        output = self._read_process(process, hidden)
+        output = self._read_process(process, hidden, output_path, row)
         code = process.poll()
         self._process = None
         output = self._scrub(route, output)
@@ -301,21 +305,54 @@ class PromptTestDialog(tk.Toplevel):
             }
         return {"creationflags": subprocess.CREATE_NEW_CONSOLE}
 
-    def _read_process(self, process, hidden):
-        if not hidden or process.stdout is None:
+    def _read_process(self, process, hidden, output_path=None, row=None):
+        """Wait for the child while surfacing progress and stopping once its file settles.
+
+        Codex sometimes keeps its wrapper process alive after the sample HTML is
+        complete. Waiting ten minutes left rows stuck on 运行中, so watch the output
+        file, report elapsed time, and end the wait after it stops changing.
+        """
+        timeout_seconds = 600
+        settle_seconds = 20
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+        last_size = None
+        stable_since = None
+        output = ""
+        while True:
             try:
-                process.wait(timeout=600)
+                output, _stderr = process.communicate(timeout=2)
+                break
             except subprocess.TimeoutExpired:
-                self._kill_process()
-                process.wait(timeout=10)
-                return "超时，已终止。"
-            return ""
-        try:
-            output, _stderr = process.communicate(timeout=600)
-        except subprocess.TimeoutExpired:
-            self._kill_process()
-            output, _stderr = process.communicate(timeout=10)
-            output = (output or "") + "\n超时，已终止。"
+                elapsed = int(time.monotonic() - started)
+                if row is not None:
+                    self._set_status(row, f"运行中 {elapsed}s", str(output_path or ""))
+                if output_path is not None and Path(output_path).is_file():
+                    try:
+                        size = Path(output_path).stat().st_size
+                    except OSError:
+                        size = 0
+                    if size > 0 and size == last_size:
+                        stable_since = stable_since or time.monotonic()
+                        if time.monotonic() - stable_since >= settle_seconds:
+                            self._kill_process()
+                            try:
+                                output, _stderr = process.communicate(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                pass
+                            return (output or "") + "\n文件已生成，进程仍在运行，已结束等待。"
+                    else:
+                        last_size = size
+                        stable_since = None
+                if time.monotonic() >= deadline:
+                    self._kill_process()
+                    try:
+                        output, _stderr = process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if not hidden:
+                        return "超时，已终止。"
+                    return ((output or "") + "\n超时，已终止。")[-4000:]
         return (output or "")[-4000:]
 
     def _scrub(self, route, output):
