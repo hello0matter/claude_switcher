@@ -107,6 +107,7 @@ def _normalise_route(route):
         "model": "",
         "reasoning_effort": "",
         "disable_response_storage": None,
+        "web_search": True,
         "wire_api": "responses",
         "models": [],
         "note": "",
@@ -125,6 +126,15 @@ def _normalise_route(route):
         result["disable_response_storage"] = str(storage).strip().lower() == "true"
     else:
         result["disable_response_storage"] = None
+    web_search = result.get("web_search")
+    if web_search in (True, False):
+        result["web_search"] = web_search
+    elif str(web_search or "").strip().lower() in {"true", "on", "enabled", "开启", "开启（默认）", "默认"}:
+        result["web_search"] = True
+    elif str(web_search or "").strip().lower() in {"false", "off", "disabled", "关闭"}:
+        result["web_search"] = False
+    else:
+        result["web_search"] = True
     result["wire_api"] = prompt_probe.normalize_wire_suffix(result.get("wire_api"), default="/responses")
     models = result.get("models", [])
     if isinstance(models, str):
@@ -151,6 +161,11 @@ def _routes_from_codex_config():
     current_model = str(config.get("model") or "")
     current_reasoning = str(config.get("model_reasoning_effort") or "")
     current_storage = config.get("disable_response_storage")
+    web_search_value = config.get("web_search")
+    if isinstance(web_search_value, bool):
+        current_web_search = web_search_value
+    else:
+        current_web_search = str(web_search_value or "").strip().lower() != "disabled"
     routes = []
     for provider_id, provider in (config.get("model_providers") or {}).items():
         if not isinstance(provider, dict):
@@ -163,6 +178,7 @@ def _routes_from_codex_config():
             "model": current_model if provider_id == current_provider else "",
             "reasoning_effort": current_reasoning if provider_id == current_provider else "",
             "disable_response_storage": current_storage if provider_id == current_provider else None,
+            "web_search": current_web_search if provider_id == current_provider else True,
             "wire_api": provider.get("wire_api", "responses"),
             "note": "从 ~/.codex/config.toml 导入",
         }))
@@ -173,6 +189,7 @@ def _routes_from_codex_config():
             "model": current_model,
             "reasoning_effort": current_reasoning,
             "disable_response_storage": current_storage,
+            "web_search": current_web_search,
         }))
     return routes
 
@@ -233,6 +250,11 @@ def _write_codex_config(route):
             del document["disable_response_storage"]
     else:
         document["disable_response_storage"] = route["disable_response_storage"]
+    if route.get("web_search", True):
+        if str(document.get("web_search") or "").strip().lower() == "disabled":
+            del document["web_search"]
+    else:
+        document["web_search"] = "disabled"
 
     providers = document.get("model_providers")
     if providers is None:
@@ -868,6 +890,8 @@ def _codex_cli_config_args(route):
     values = [("model_provider", route.get("provider_id"))]
     if route.get("reasoning_effort"):
         values.append(("model_reasoning_effort", route["reasoning_effort"]))
+    if not route.get("web_search", True):
+        values.append(("web_search", "disabled"))
     args = []
     for key, value in values:
         args.extend(["-c", f"{key}={json.dumps(str(value), ensure_ascii=False)}"])
@@ -1295,6 +1319,7 @@ class CodexRouteEditor(tk.Toplevel):
             ("模型列表（逗号）", "models"),
             ("推理强度", "reasoning_effort"),
             ("禁用响应存储", "disable_response_storage"),
+            ("Web 搜索", "web_search"),
             ("wire API", "wire_api"),
             ("备注", "note"),
         ]
@@ -1324,6 +1349,15 @@ class CodexRouteEditor(tk.Toplevel):
                     values=("默认", "true", "false"),
                     state="readonly",
                 )
+            elif key == "web_search":
+                var.set("开启（默认）" if route.get("web_search", True) else "关闭")
+                entry = ttk.Combobox(
+                    self,
+                    textvariable=var,
+                    width=40,
+                    values=("开启（默认）", "关闭"),
+                    state="readonly",
+                )
             elif key == "wire_api":
                 var.set(prompt_probe.wire_suffix_label(route.get("wire_api")))
                 entry = ttk.Combobox(
@@ -1340,7 +1374,10 @@ class CodexRouteEditor(tk.Toplevel):
                 self.key_entry = entry
                 tk.Button(self, text="显示", width=5, command=self._toggle_key).grid(row=row, column=2, padx=(0, 8))
         self._key_visible = False
-        hint = "这是追加在 API 地址末尾的路径，也可以自己填。API 地址按原样保存，不会自动删后缀。选（不追加）就是什么也不加。"
+        hint = (
+            "wire API 是追加在 API 地址末尾的路径，也可以自己填。API 地址按原样保存，不会自动删后缀。选（不追加）就是什么也不加。\n"
+            "Web 搜索默认开启；Mimo 等网关不支持 web_search 工具时改成关闭，会写 web_search = \"disabled\"。"
+        )
         tk.Label(self, text=hint, fg="#8a5a00", wraplength=430, justify="left").grid(
             row=len(fields), column=0, columnspan=3, padx=12, pady=(0, 4), sticky="w"
         )
@@ -1367,6 +1404,7 @@ class CodexRouteEditor(tk.Toplevel):
             "true": True,
             "false": False,
         }.get(storage)
+        values["web_search"] = not values["web_search"].startswith("关闭")
         self.result = _normalise_route(values)
         self.destroy()
 
@@ -1534,8 +1572,8 @@ class CodexPanel(tk.Frame):
         tk.Label(right, text="Codex 详情", font=("", 10, "bold")).pack(anchor="w")
         detail = tk.LabelFrame(right, padx=8, pady=6)
         detail.pack(fill="x", expand=False)
-        self.detail_vars = {key: tk.StringVar() for key in ("name", "provider_id", "base_url", "api_key", "model", "reasoning_effort", "disable_response_storage", "wire_api", "note")}
-        for label, key in (("名称", "name"), ("provider ID", "provider_id"), ("API 地址", "base_url"), ("Bearer 密钥", "api_key"), ("模型", "model"), ("推理强度", "reasoning_effort"), ("禁用响应存储", "disable_response_storage"), ("wire API", "wire_api"), ("备注", "note")):
+        self.detail_vars = {key: tk.StringVar() for key in ("name", "provider_id", "base_url", "api_key", "model", "reasoning_effort", "disable_response_storage", "web_search", "wire_api", "note")}
+        for label, key in (("名称", "name"), ("provider ID", "provider_id"), ("API 地址", "base_url"), ("Bearer 密钥", "api_key"), ("模型", "model"), ("推理强度", "reasoning_effort"), ("禁用响应存储", "disable_response_storage"), ("Web 搜索", "web_search"), ("wire API", "wire_api"), ("备注", "note")):
             row = tk.Frame(detail)
             row.pack(fill="x", pady=2)
             tk.Label(row, text=label + ":", width=13, anchor="w", fg="#666").pack(side="left")
@@ -1711,6 +1749,7 @@ class CodexPanel(tk.Frame):
         self.detail_vars["wire_api"].set(prompt_probe.wire_suffix_label(route.get("wire_api")))
         storage = route.get("disable_response_storage")
         self.detail_vars["disable_response_storage"].set("默认" if storage is None else str(storage).lower())
+        self.detail_vars["web_search"].set("开启（默认）" if route.get("web_search", True) else "关闭")
         self.detail_vars["api_key"].set(_mask_secret(route.get("api_key")))
 
     def refresh_status(self):

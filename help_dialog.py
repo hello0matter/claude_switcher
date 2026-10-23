@@ -27,6 +27,7 @@ Codex CLI 只支持 Responses 接口。wire API 选 /completions 或 /chat/compl
 
 6. 启动时执行提示词测试
 勾选后，启动 Codex 或 Codexx 会先弹确认窗，再打开可见控制台。只启动当前高亮路线。wire API 是追加在 API 地址末尾的路径。Codex 只能用 /responses；/chat/completions 等后缀仅用于本软件直连模型测试。选（不追加）只影响软件直连 URL，Codex 仍然按 Responses 请求。API 地址按原样保存，不会自动删掉已有后缀。
+路线编辑里的“Web 搜索”默认开启，并按路线保存。关闭时会写入 web_search = "disabled"；重新开启时会移除这一行，让 Codex 回到默认开启。切换 Mimo 等不支持 web_search 工具的网关时请关闭；下次再切回这条路线仍会保持关闭。
 
 API 地址、wire 后缀和 Codex 配置文件的关系
 
@@ -38,7 +39,7 @@ API 地址、wire 后缀和 Codex 配置文件的关系
 
 Codex CLI 0.154 只支持 Responses 接口，并且会自己在 base_url 后面拼 /responses。因此 API 地址建议只填到 /v1，wire 选 /responses。不要把 /responses 也塞进 API 地址，否则可能变成 /responses/responses。也不要给 Codex 写 wire_api = "chat" 或 /completions：Codex 已经移除 chat 接口，写了也不会走那个端点。
 /completions 和 /chat/completions 只适合“模型测试表格”等本软件直连请求；路线提示词测试会跳过并提示改成 /responses。小米 Mimo 的 mimo-v2.6-pro 和 mimo-v2.6-flash 已验证使用 https://api.xiaomimimo.com/v1 + /responses 可以正常完成 Codex 请求；原来 Flash 路线的 /completions 已改为 /responses。
-提示词测试还会在本次进程参数里加 web_search="disabled"，避免部分网关因为不认识 web_search 工具而直接报错。这个开关只影响本次测试，不改写 config.toml 里的全局 web_search。
+提示词测试还会在本次进程参数里加 web_search="disabled"，避免部分网关因为不认识 web_search 工具而直接报错。这个开关只影响本次测试；正常启动 Codex 时使用的是路线编辑里保存的“Web 搜索”开关。
 
 本软件网络设置
 

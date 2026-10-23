@@ -211,6 +211,22 @@ class CodexPanelCoreTests(unittest.TestCase):
             self.assertEqual(routes[0]["provider_id"], "edge")
             self.assertEqual(routes[0]["model"], "gpt-test")
             self.assertEqual(routes[0]["reasoning_effort"], "high")
+            self.assertTrue(routes[0]["web_search"])
+
+    def test_routes_import_disabled_web_search_from_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.toml"
+            config.write_text(
+                'model_provider = "edge"\n'
+                'web_search = "disabled"\n'
+                '[model_providers.edge]\n'
+                'base_url = "https://edge.example/v1"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.object(codex_panel, "CODEX_CONFIG_FILE", config):
+                routes = codex_panel._routes_from_codex_config()
+            self.assertFalse(routes[0]["web_search"])
 
     def test_write_config_preserves_unrelated_sections(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -476,6 +492,67 @@ class CodexPanelCoreTests(unittest.TestCase):
                 codex_panel._write_codex_config(route)
             parsed = codex_panel.tomllib.loads(config.read_text(encoding="utf-8"))
             self.assertIs(parsed["disable_response_storage"], False)
+
+    def test_route_web_search_defaults_on_and_accepts_labels(self):
+        self.assertTrue(codex_panel._normalise_route({"name": "Default"})["web_search"])
+        self.assertTrue(
+            codex_panel._normalise_route({"name": "Label on", "web_search": "开启（默认）"})["web_search"]
+        )
+        self.assertFalse(
+            codex_panel._normalise_route({"name": "Label off", "web_search": "关闭"})["web_search"]
+        )
+
+    def test_write_config_disables_web_search_and_restores_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.toml"
+            config.write_text('web_search = "cached"\n', encoding="utf-8")
+            route = codex_panel._normalise_route({
+                "name": "Mimo",
+                "provider_id": "example",
+                "web_search": False,
+            })
+            with mock.patch.object(codex_panel, "CODEX_HOME", root), mock.patch.object(
+                codex_panel, "CODEX_CONFIG_FILE", config
+            ):
+                codex_panel._write_codex_config(route)
+            parsed = codex_panel.tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["web_search"], "disabled")
+
+            route["web_search"] = True
+            with mock.patch.object(codex_panel, "CODEX_HOME", root), mock.patch.object(
+                codex_panel, "CODEX_CONFIG_FILE", config
+            ):
+                codex_panel._write_codex_config(route)
+            parsed = codex_panel.tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertNotIn("web_search", parsed)
+
+    def test_write_config_preserves_existing_enabled_web_search_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.toml"
+            config.write_text('web_search = "live"\n', encoding="utf-8")
+            route = codex_panel._normalise_route({
+                "name": "Search enabled",
+                "provider_id": "example",
+                "web_search": True,
+            })
+            with mock.patch.object(codex_panel, "CODEX_HOME", root), mock.patch.object(
+                codex_panel, "CODEX_CONFIG_FILE", config
+            ):
+                codex_panel._write_codex_config(route)
+            parsed = codex_panel.tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["web_search"], "live")
+
+    def test_codex_cli_args_disable_web_search_only_when_route_says_off(self):
+        route = codex_panel._normalise_route({
+            "name": "Mimo",
+            "provider_id": "example",
+            "web_search": False,
+        })
+        self.assertIn('web_search="disabled"', codex_panel._codex_cli_config_args(route))
+        route["web_search"] = True
+        self.assertNotIn('web_search="disabled"', codex_panel._codex_cli_config_args(route))
 
     def test_fast_visibility_sync_does_not_scan_rollout_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
