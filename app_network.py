@@ -214,6 +214,9 @@ class NetworkSettingsDialog(tk.Toplevel):
         tk.Button(buttons, text="测试代理端口", command=self._test_proxy).pack(
             side="left", padx=4
         )
+        tk.Button(buttons, text="编辑提示词测试", command=self._edit_prompt).pack(
+            side="left", padx=4
+        )
         tk.Button(
             buttons,
             text="保存",
@@ -239,6 +242,11 @@ class NetworkSettingsDialog(tk.Toplevel):
         if not 1 <= port <= 65535:
             raise ValueError("代理端口必须在 1 到 65535 之间")
         return {"mode": mode, "host": host, "port": port}
+
+    def _edit_prompt(self):
+        from prompt_test_dialog import PromptSettingsDialog
+
+        PromptSettingsDialog(self)
 
     def _test_proxy(self):
         try:

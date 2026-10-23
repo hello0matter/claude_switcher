@@ -25,6 +25,7 @@ from app_network import (
 from benchmark_dialog import BenchmarkDialog
 from cost_comparison import CostComparisonDialog
 from help_dialog import HelpDialog
+from route_batch_dialog import RouteBatchDialog
 
 CONFIG_FILE   = os.path.expanduser("~/.cc_routes.json")
 SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
@@ -1682,20 +1683,13 @@ class App(tk.Tk):
         BenchmarkDialog(self, entries)
 
     def _check_selected_route_integrity(self):
-        idx = self._selected_idx()
-        if idx is None:
-            messagebox.showwarning("提示", "请先选择要检测的 Claude 路线", parent=self)
+        indexes = self._selected_indices()
+        if not indexes:
+            messagebox.showwarning("提示", "请先选择要检测的 Claude 路线；按住 Ctrl 可批量检测。", parent=self)
             return
-        route = self.routes[idx]
-        self.route_integrity_button.config(state="disabled", text="检测中，请稍候…")
-        self.status_var.set(
-            f"正在手动检测 {route['name']}；只发送随机验证码，不启动 Claude、不修改全局配置。"
-        )
-        threading.Thread(
-            target=self._run_claude_integrity_check,
-            args=(copy.deepcopy(route),),
-            daemon=True,
-        ).start()
+        routes = [copy.deepcopy(self.routes[index]) for index in indexes]
+        self.status_var.set(f"正在批量检测 {len(routes)} 条 Claude 路线；不启动 Claude、不修改全局配置。")
+        RouteBatchDialog(self, "Claude 中转站投毒检测", routes, check_claude_route_integrity, {"passed"})
 
     def _run_claude_integrity_check(self, route):
         result = check_claude_route_integrity(route)
@@ -1719,18 +1713,13 @@ class App(tk.Tk):
             messagebox.showwarning("Claude 中转站投毒检测", message, parent=self)
 
     def _check_selected_route_anomaly(self):
-        idx = self._selected_idx()
-        if idx is None:
-            messagebox.showwarning("提示", "请先选择要检测的 Claude 路线", parent=self)
+        indexes = self._selected_indices()
+        if not indexes:
+            messagebox.showwarning("提示", "请先选择要检测的 Claude 路线；按住 Ctrl 可批量检测。", parent=self)
             return
-        route = self.routes[idx]
-        self.route_anomaly_button.config(state="disabled", text="检查中，请稍候…")
-        self.status_var.set(f"正在检查 {route['name']} 是否发生请求中断或异常。")
-        threading.Thread(
-            target=self._run_claude_anomaly_check,
-            args=(copy.deepcopy(route),),
-            daemon=True,
-        ).start()
+        routes = [copy.deepcopy(self.routes[index]) for index in indexes]
+        self.status_var.set(f"正在批量检查 {len(routes)} 条 Claude 路线是否异常。")
+        RouteBatchDialog(self, "Claude 路线异常检测", routes, check_claude_route_anomaly, {"normal"})
 
     def _run_claude_anomaly_check(self, route):
         result = check_claude_route_anomaly(route)

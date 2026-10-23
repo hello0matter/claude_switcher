@@ -28,6 +28,9 @@ from tkinter import messagebox, simpledialog, ttk
 from app_network import describe_network_error, open_app_request
 from benchmark_dialog import BenchmarkDialog
 from cost_comparison import CostComparisonDialog
+import prompt_probe
+from prompt_test_dialog import PromptSettingsDialog, PromptTestDialog
+from route_batch_dialog import RouteBatchDialog
 import terminal_launch
 
 try:
@@ -207,6 +210,8 @@ def _backup_file(path):
 
 
 def _write_codex_config(route):
+    route = dict(route)
+    route["base_url"], _suffix_kind = prompt_probe.strip_manual_wire_suffix(route.get("base_url"))
     if tomlkit is None:
         raise RuntimeError("缺少 tomlkit，无法安全写入 config.toml。请运行：python -m pip install tomlkit")
     if route["wire_api"] != "responses":
@@ -865,7 +870,52 @@ def _codex_cli_config_args(route):
     return args
 
 
-def _codex_console_command(binary, route=None):
+def _codex_exec_arguments(binary, route, prompt, workdir):
+    if binary == "codex":
+        executable = os.environ.get("CODEX_COMMAND", "codex")
+    elif binary == "codexx":
+        if not CODEXX_EXE.is_file():
+            raise FileNotFoundError(f"找不到 Codexx：{CODEXX_EXE}")
+        executable = str(CODEXX_EXE)
+    else:
+        raise ValueError(f"未知 Codex 程序：{binary}")
+    arguments = [
+        executable,
+        "exec",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-C",
+        str(workdir),
+    ]
+    if route.get("model"):
+        arguments.extend(["-m", str(route["model"])])
+    arguments.extend(prompt_probe.config_override_args(route))
+    arguments.extend(["--json", str(prompt)])
+    return arguments
+
+
+def _powershell_command(arguments, hold=False):
+    invocation = "& " + " ".join(_powershell_quote(value) for value in arguments)
+    command = [_powershell_console(), "-NoProfile"]
+    if hold:
+        command.append("-NoExit")
+    command.extend(["-Command", invocation])
+    return command
+
+
+def prompt_test_command(binary, route, prompt, workdir, hidden):
+    arguments = _codex_exec_arguments(binary, route, prompt, workdir)
+    if len(" ".join(arguments)) > 12000:
+        raise ValueError("路线参数太长，无法安全放进命令行。请缩短提示词后再测。")
+    # Windows Codex is often an npm PowerShell shim, so exec must go through
+    # powershell.exe. Do not use -NoExit here: a held window would block the next route.
+    if os.name == "nt":
+        return _powershell_command(arguments, hold=False)
+    del hidden
+    return arguments
+
+
+def _codex_console_command(binary, route=None, prompt=None, workdir=None):
     if binary == "codex":
         executable = os.environ.get("CODEX_COMMAND", "codex")
     elif binary == "codexx":
@@ -880,6 +930,10 @@ def _codex_console_command(binary, route=None):
             arguments.extend(["-m", str(route["model"])])
         arguments.extend(_codex_cli_config_args(route))
     arguments.append("--yolo")
+    if workdir:
+        arguments.extend(["-C", str(workdir)])
+    if prompt:
+        arguments.append(str(prompt))
     if os.name == "nt":
         invocation = "& " + " ".join(_powershell_quote(value) for value in arguments)
         return [_powershell_console(), "-NoExit", "-Command", invocation]
@@ -1266,13 +1320,8 @@ class CodexRouteEditor(tk.Toplevel):
                     state="readonly",
                 )
             elif key == "wire_api":
-                entry = ttk.Combobox(
-                    self,
-                    textvariable=var,
-                    width=40,
-                    values=("responses",),
-                    state="readonly",
-                )
+                var.set("/responses")
+                entry = tk.Entry(self, textvariable=var, width=43, state="disabled")
             else:
                 entry = tk.Entry(self, textvariable=var, width=43, show="*" if key == "api_key" else "")
             entry.grid(row=row, column=1, padx=4, pady=5)
@@ -1281,8 +1330,14 @@ class CodexRouteEditor(tk.Toplevel):
                 self.key_entry = entry
                 tk.Button(self, text="显示", width=5, command=self._toggle_key).grid(row=row, column=2, padx=(0, 8))
         self._key_visible = False
+        hint = "固定追加在 API 地址末尾，不能手改，也不提供传统 chat/completions 模式。"
+        if str(route.get("wire_api") or "") not in ("", "responses"):
+            hint = "这条路线原来不是 responses。保存时会固定为 /responses，不能选传统模式。"
+        tk.Label(self, text=hint, fg="#8a5a00", wraplength=430, justify="left").grid(
+            row=len(fields), column=0, columnspan=3, padx=12, pady=(0, 4), sticky="w"
+        )
         buttons = tk.Frame(self)
-        buttons.grid(row=len(fields), column=0, columnspan=3, pady=(8, 12))
+        buttons.grid(row=len(fields) + 1, column=0, columnspan=3, pady=(8, 12))
         tk.Button(buttons, text="保存", width=12, command=self._save).pack(side="left", padx=5)
         tk.Button(buttons, text="取消", width=12, command=self.destroy).pack(side="left", padx=5)
         self.grab_set()
@@ -1297,6 +1352,13 @@ class CodexRouteEditor(tk.Toplevel):
         if not values["name"] or not values["provider_id"]:
             messagebox.showwarning("提示", "名称和 provider ID 不能为空", parent=self)
             return
+        values = prompt_probe.prepare_route_form(values)
+        if values.pop("wire_suffix_kind") == "traditional":
+            messagebox.showwarning(
+                "不支持传统模式",
+                "API 地址末尾的传统模式路径已去掉。软件只会固定追加 /responses，不能手改，也不能改成 chat/completions。",
+                parent=self,
+            )
         values["models"] = [item.strip() for item in values["models"].split(",") if item.strip()]
         storage = values["disable_response_storage"].lower()
         values["disable_response_storage"] = {
@@ -1479,6 +1541,16 @@ class CodexPanel(tk.Frame):
         action = tk.Frame(right)
         action.pack(fill="x", pady=(10, 0))
         tk.Button(action, text="仅切换全局路线（不启动）", command=self.apply_global, bg="#13795b", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(fill="x", pady=(0, 4))
+        self.launch_prompt_test_var = tk.BooleanVar(value=False)
+        launch_options = tk.Frame(action)
+        launch_options.pack(fill="x", pady=(0, 4))
+        tk.Checkbutton(
+            launch_options,
+            text="启动时执行提示词测试",
+            variable=self.launch_prompt_test_var,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        tk.Button(launch_options, text="编辑提示词", command=self.edit_prompt_settings).pack(side="right")
         launch_row = tk.Frame(action)
         launch_row.pack(fill="x", pady=(0, 4))
         tk.Button(launch_row, text="用选中路线启动 Codex", command=self.launch, bg="#238636", fg="white", font=("", 10, "bold"), relief="flat", pady=5).pack(side="left", fill="x", expand=True, padx=(0, 2))
@@ -1530,16 +1602,28 @@ class CodexPanel(tk.Frame):
             relief="flat",
             pady=5,
         ).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        capability_row = tk.Frame(action)
+        capability_row.pack(fill="x", pady=(0, 4))
         tk.Button(
-            action,
-            text="路线能力对比（每条路线 6 题）",
+            capability_row,
+            text="路线能力对比",
             command=self.open_benchmark,
             bg="#6a1b9a",
             fg="white",
             font=("", 10, "bold"),
             relief="flat",
             pady=5,
-        ).pack(fill="x", pady=(0, 4))
+        ).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        tk.Button(
+            capability_row,
+            text="路线提示词测试",
+            command=self.open_prompt_test,
+            bg="#1f6f9f",
+            fg="white",
+            font=("", 10, "bold"),
+            relief="flat",
+            pady=5,
+        ).pack(side="left", fill="x", expand=True, padx=(2, 0))
         integrity_row = tk.Frame(action)
         integrity_row.pack(fill="x", pady=(0, 4))
         self.route_integrity_button = tk.Button(
@@ -1622,6 +1706,7 @@ class CodexPanel(tk.Frame):
         route = self.routes[index]
         for key in ("name", "provider_id", "base_url", "model", "reasoning_effort", "wire_api", "note"):
             self.detail_vars[key].set(route.get(key) or "(未设置)")
+        self.detail_vars["wire_api"].set("/responses（固定追加，不可改，无传统模式）")
         storage = route.get("disable_response_storage")
         self.detail_vars["disable_response_storage"].set("默认" if storage is None else str(storage).lower())
         self.detail_vars["api_key"].set(_mask_secret(route.get("api_key")))
@@ -1788,21 +1873,76 @@ class CodexPanel(tk.Frame):
         except Exception as exc:
             messagebox.showerror("数据库优化失败", str(exc), parent=self)
 
+    def edit_prompt_settings(self):
+        PromptSettingsDialog(self)
+
+    def _prepare_launch_prompt(self, route):
+        settings = prompt_probe.load_prompt_settings()
+        directory = Path(settings["output_dir"])
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("输出目录不可用", str(exc), parent=self)
+            return None
+        cleaned = dict(route)
+        cleaned["base_url"], suffix_kind = prompt_probe.strip_manual_wire_suffix(route.get("base_url"))
+        cleaned["wire_api"] = prompt_probe.LOCKED_WIRE_API
+        output_path = prompt_probe.unique_output_path(directory, prompt_probe.prompt_filename(cleaned))
+        prompt = prompt_probe.render_prompt(settings["prompt"], cleaned, output_path)
+        notes = []
+        if len(self.selected_indices()) > 1:
+            notes.append("当前多选了多条路线，这次只会启动高亮的那一条。批量请用“路线提示词测试”。")
+        if suffix_kind == "traditional":
+            notes.append("API 地址里的传统模式后缀会去掉，固定追加 /responses。")
+        if not cleaned.get("model"):
+            notes.append("这条路线没有模型名，文件名会用 nomodel，Codex 可能使用配置里的默认模型。")
+        if prompt_probe.prompt_mentions_git_publish(prompt):
+            notes.append("提示词包含提交或推送，模型可能会改 git 仓库。")
+        message = (
+            f"将启动并让模型写文件：\n{output_path}\n\n"
+            f"路线：{route.get('name')}\n"
+            f"模型：{route.get('model') or '(未设置)'}\n"
+            f"强度：{route.get('reasoning_effort') or '默认'}\n"
+            f"形式：responses（固定追加到 API 地址末尾）\n\n"
+            + ("\n".join(notes) + "\n\n" if notes else "")
+            + "确认后会写入当前 Codex 全局配置。取消则不启动。"
+        )
+        if not messagebox.askyesno("启动并执行提示词测试", message, parent=self):
+            return None
+        return prompt, directory
+
+    def open_prompt_test(self):
+        indexes = self.selected_indices()
+        if not indexes:
+            messagebox.showwarning("请选择路线", "至少选择一条 Codex 路线；按住 Ctrl 可多选。", parent=self)
+            return
+        routes = [copy.deepcopy(self.routes[index]) for index in indexes]
+        PromptTestDialog(self, routes, prompt_test_command)
+
     def _launch_binary(self, binary):
         route = self._selected_route()
         if route is None:
             messagebox.showwarning("提示", "请先选择一条 Codex 路线", parent=self)
             return
         display_name = "Codexx" if binary == "codexx" else "Codex"
+        prompt = None
+        workdir = None
+        if self.launch_prompt_test_var.get():
+            prepared = self._prepare_launch_prompt(route)
+            if prepared is None:
+                return
+            prompt, workdir = prepared
         try:
-            if route is not None:
-                self._apply(route)
-            command = _codex_console_command(binary, route)
+            self._apply(route)
+            command = _codex_console_command(binary, route, prompt=prompt, workdir=workdir)
             popen_kwargs = {}
+            if workdir is not None:
+                popen_kwargs["cwd"] = str(workdir)
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
             subprocess.Popen(command, **popen_kwargs)
-            self.status_var.set(f"已用 {route['name']} 启动 {display_name}")
+            suffix = "，并已附带提示词测试" if prompt else ""
+            self.status_var.set(f"已用 {route['name']} 启动 {display_name}{suffix}")
         except FileNotFoundError as exc:
             detail = str(exc) if str(exc) else f"找不到 {display_name} 二进制文件"
             messagebox.showerror("错误", detail, parent=self)
@@ -1852,20 +1992,26 @@ class CodexPanel(tk.Frame):
         ]
         BenchmarkDialog(self, entries)
 
+    def _probe_route(self, route, runner):
+        cleaned = dict(route)
+        cleaned["base_url"], _kind = prompt_probe.strip_manual_wire_suffix(route.get("base_url"))
+        cleaned["wire_api"] = prompt_probe.LOCKED_WIRE_API
+        return runner(cleaned)
+
     def check_selected_route_integrity(self):
-        route = self._selected_route()
-        if route is None:
-            messagebox.showwarning("提示", "请先选择要检测的中转路线", parent=self)
+        indexes = self.selected_indices()
+        if not indexes:
+            messagebox.showwarning("提示", "请先选择要检测的中转路线；按住 Ctrl 可批量检测。", parent=self)
             return
-        self.route_integrity_button.config(state="disabled", text="正在检测，请稍候…")
-        self.status_var.set(
-            f"正在手动检测 {route['name']}；只发送随机验证码，不读取 Session。"
+        routes = [copy.deepcopy(self.routes[index]) for index in indexes]
+        self.status_var.set(f"正在批量检测 {len(routes)} 条路线是否投毒；不改全局配置。")
+        RouteBatchDialog(
+            self,
+            "中转站投毒检测",
+            routes,
+            lambda route: self._probe_route(route, check_codex_route_integrity),
+            {"passed"},
         )
-        threading.Thread(
-            target=self._run_route_integrity_check,
-            args=(copy.deepcopy(route),),
-            daemon=True,
-        ).start()
 
     def _run_route_integrity_check(self, route):
         result = check_codex_route_integrity(route)
@@ -1889,17 +2035,19 @@ class CodexPanel(tk.Frame):
             messagebox.showwarning("中转站投毒检测", message, parent=self)
 
     def check_selected_route_anomaly(self):
-        route = self._selected_route()
-        if route is None:
-            messagebox.showwarning("提示", "请先选择要检测的 Codex 路线", parent=self)
+        indexes = self.selected_indices()
+        if not indexes:
+            messagebox.showwarning("提示", "请先选择要检测的 Codex 路线；按住 Ctrl 可批量检测。", parent=self)
             return
-        self.route_anomaly_button.config(state="disabled", text="正在检查路线，请稍候…")
-        self.status_var.set(f"正在检查 {route['name']} 是否发生请求中断或异常。")
-        threading.Thread(
-            target=self._run_route_anomaly_check,
-            args=(copy.deepcopy(route),),
-            daemon=True,
-        ).start()
+        routes = [copy.deepcopy(self.routes[index]) for index in indexes]
+        self.status_var.set(f"正在批量检查 {len(routes)} 条路线是否异常；不改全局配置。")
+        RouteBatchDialog(
+            self,
+            "Codex 路线异常检测",
+            routes,
+            lambda route: self._probe_route(route, check_codex_route_anomaly),
+            {"normal"},
+        )
 
     def _run_route_anomaly_check(self, route):
         result = check_codex_route_anomaly(route)
