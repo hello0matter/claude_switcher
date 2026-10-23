@@ -80,6 +80,26 @@ class PromptProbeTests(unittest.TestCase):
     def test_unsafe_provider_id_is_rejected_for_batch(self):
         self.assertTrue(prompt_probe.provider_id_problem({"provider_id": "mc 5.5"}))
         self.assertEqual(prompt_probe.provider_id_problem({"provider_id": "mc"}), "")
+    def test_prompt_test_disables_web_search_per_process(self):
+        args = prompt_probe.config_override_args(
+            {
+                "provider_id": "mc",
+                "base_url": "https://api.example/v1",
+                "api_key": "secret",
+                "wire_api": "/responses",
+            }
+        )
+        self.assertIn('web_search="disabled"', args)
+
+    def test_prompt_test_rejects_non_responses_wire_suffixes(self):
+        self.assertEqual(prompt_probe.prompt_wire_problem({"wire_api": "/responses"}), "")
+        self.assertEqual(prompt_probe.prompt_wire_problem({"wire_api": ""}), "")
+        self.assertIn("/completions", prompt_probe.prompt_wire_problem({"wire_api": "/completions"}))
+        self.assertIn(
+            "/chat/completions",
+            prompt_probe.prompt_wire_problem({"wire_api": "/chat/completions"}),
+        )
+
 
     def test_launch_command_can_carry_prompt_without_changing_plain_launch(self):
         with mock.patch.object(codex_panel, "_powershell_console", return_value="pwsh.exe"):

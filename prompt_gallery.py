@@ -21,12 +21,16 @@ def day_name(when=None):
     return (when or datetime.now()).strftime("%Y-%m-%d")
 
 
+_ALLOCATE_LOCK = threading.Lock()
+
+
 def allocate_prompt_output(root, route, when=None):
     """Put one sample in a day folder. Comparison pages are written separately."""
     moment = when or datetime.now()
     day = Path(root) / day_name(moment)
-    day.mkdir(parents=True, exist_ok=True)
-    return prompt_probe.unique_output_path(day, prompt_probe.prompt_filename(route, moment))
+    with _ALLOCATE_LOCK:
+        day.mkdir(parents=True, exist_ok=True)
+        return prompt_probe.unique_output_path(day, prompt_probe.prompt_filename(route, moment))
 
 
 def parse_sample_name(filename):

@@ -138,6 +138,23 @@ def codex_config_wire_api(value):
     return None
 
 
+def prompt_wire_problem(route):
+    """Return why Codex cannot run this route, or an empty string when it can.
+
+    Codex CLI 0.154 only implements the Responses API. A route saved for
+    /chat/completions or /completions can still be useful for direct HTTP model
+    tests, but it must not silently pretend that Codex used that endpoint.
+    """
+    suffix = normalize_wire_suffix(route.get("wire_api"), default="")
+    if suffix in {"", "/responses", "/v1/responses"}:
+        return ""
+    return (
+        f"Codex 只支持 Responses 接口（/responses），这条路线选的是 {suffix}。"
+        "请把 wire API 改成 /responses 后再做提示词测试；"
+        "直接 HTTP 模型测试仍可使用原来的后缀。"
+    )
+
+
 def prepare_route_form(values):
     """Keep the API address exactly as entered, aside from a trailing slash."""
     prepared = dict(values)
@@ -253,6 +270,10 @@ def config_override_args(route):
     storage = route.get("disable_response_storage")
     if storage in (True, False):
         args.extend(["-c", f"disable_response_storage={str(storage).lower()}"])
+    # Some gateways reject unknown tool types instead of ignoring them. Prompt
+    # tests never need web search, so disable it per process without touching
+    # the user's global ~/.codex/config.toml.
+    args.extend(["-c", 'web_search="disabled"'])
     return args
 
 

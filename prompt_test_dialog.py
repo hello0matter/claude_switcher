@@ -1,11 +1,13 @@
 """Batch prompt-test window. One window lists every selected route."""
 
 import os
+import queue
 import subprocess
 import threading
 import time
 import tkinter as tk
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
@@ -73,24 +75,42 @@ class PromptSettingsDialog(tk.Toplevel):
         self.destroy()
 
 
+def _worker_limit(value, total):
+    """Clamp the GUI concurrency selector to a useful worker count."""
+    try:
+        count = int(str(value).strip())
+    except (TypeError, ValueError):
+        count = 3
+    return max(1, min(count, max(1, int(total))))
+
+
 class PromptTestDialog(tk.Toplevel):
     def __init__(self, parent, routes, command_builder):
         super().__init__(parent)
         self.title("路线提示词测试")
-        self.geometry("980x620")
-        self.minsize(820, 480)
+        self.geometry("980x640")
+        self.minsize(820, 500)
         self.routes = list(routes)
         self.command_builder = command_builder
         self._stop = False
         self._running = False
-        self._process = None
+        self._processes = {}
+        self._process_lock = threading.Lock()
+        self._progress_lock = threading.Lock()
+        self._active_count = 0
+        self._done_count = 0
+        self._batch_total = 0
+        self._batch_workers = 3
+        self._batch = None
+        self._ui_queue = queue.Queue()
         self.rows = []
         settings = prompt_probe.load_prompt_settings()
         self.hidden_var = tk.BooleanVar(value=settings["hidden"])
         self.binary_var = tk.StringVar(value="codex")
+        self.workers_var = tk.StringVar(value="3")
 
         bar = tk.Frame(self)
-        bar.pack(fill="x", padx=10, pady=(8, 4))
+        bar.pack(fill="x", padx=10, pady=(8, 2))
         tk.Label(bar, text="程序").pack(side="left")
         ttk.Combobox(
             bar,
@@ -98,14 +118,29 @@ class PromptTestDialog(tk.Toplevel):
             values=("codex", "codexx"),
             state="readonly",
             width=10,
-        ).pack(side="left", padx=(4, 10))
-        tk.Checkbutton(bar, text="隐匿运行", variable=self.hidden_var).pack(side="left", padx=(0, 8))
-        tk.Button(bar, text="开始测试", command=self.start, bg="#1f6f9f", fg="white", relief="flat").pack(side="left", padx=2)
-        tk.Button(bar, text="停止", command=self.stop).pack(side="left", padx=2)
-        tk.Button(bar, text="编辑提示词", command=self.edit_prompt).pack(side="left", padx=2)
-        tk.Button(bar, text="打开输出目录", command=self.open_dir).pack(side="left", padx=2)
-        tk.Button(bar, text="打开对比页", command=self.open_gallery).pack(side="left", padx=2)
-        self.status_var = tk.StringVar(value=f"已选 {len(self.routes)} 条。开始后按顺序跑，结果都列在这个窗口里。")
+        ).pack(side="left", padx=(4, 12))
+        tk.Checkbutton(bar, text="隐匿运行", variable=self.hidden_var).pack(side="left", padx=(0, 12))
+        tk.Label(bar, text="并发").pack(side="left")
+        ttk.Combobox(
+            bar,
+            textvariable=self.workers_var,
+            values=("1", "2", "3", "4", "5", "6"),
+            state="readonly",
+            width=4,
+        ).pack(side="left", padx=(4, 12))
+        tk.Label(bar, text="站点限流时可调成 1–2 路", fg="#666").pack(side="left")
+
+        actions = tk.Frame(self)
+        actions.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Button(actions, text="开始测试", command=self.start, bg="#1f6f9f", fg="white", relief="flat").pack(side="left", padx=2)
+        tk.Button(actions, text="停止", command=self.stop).pack(side="left", padx=2)
+        tk.Button(actions, text="编辑提示词", command=self.edit_prompt).pack(side="left", padx=2)
+        tk.Button(actions, text="打开输出目录", command=self.open_dir).pack(side="left", padx=2)
+        tk.Button(actions, text="打开对比页", command=self.open_gallery).pack(side="left", padx=2)
+
+        self.status_var = tk.StringVar(
+            value=f"已选 {len(self.routes)} 条。默认并发 3 路运行，结果都列在这个窗口里。"
+        )
         tk.Label(self, textvariable=self.status_var, anchor="w", justify="left", wraplength=940).pack(fill="x", padx=10)
 
         columns = ("name", "model", "effort", "wire", "status", "file")
@@ -118,7 +153,7 @@ class PromptTestDialog(tk.Toplevel):
             "status": "状态",
             "file": "文件",
         }
-        widths = {"name": 180, "model": 140, "effort": 70, "wire": 90, "status": 140, "file": 320}
+        widths = {"name": 180, "model": 140, "effort": 70, "wire": 90, "status": 150, "file": 320}
         for key, label in headings.items():
             self.tree.heading(key, text=label)
             self.tree.column(key, width=widths[key], anchor="w")
@@ -129,9 +164,9 @@ class PromptTestDialog(tk.Toplevel):
         self.detail.insert(
             "1.0",
             "隐匿运行适合批量：不给每条路线弹一个 Codex 窗口，输出写在下面。\n"
-            "不隐匿时会打开控制台，方便看模型有没有自己写文件。\n"
-            "默认提示词禁止 git commit / push。输出目录不是 git 仓库时，模型也不该去碰别的仓库。\n"
-            "批量测试只用本次进程参数，不改写 ~/.codex/config.toml。密钥不会显示在这个窗口里。",
+            "并发数建议 3；站点限流、机器吃紧或输出目录在机械盘时改成 1–2。\n"
+            "Codex 只支持 Responses 接口，选 /completions 或 /chat/completions 的路线会直接跳过并提示原因。\n"
+            "批量测试只禁用本次进程的 web_search，不改写 ~/.codex/config.toml。密钥不会显示在这个窗口里。",
         )
         for route in self.routes:
             item = self.tree.insert(
@@ -141,13 +176,32 @@ class PromptTestDialog(tk.Toplevel):
                     route.get("name") or "未命名",
                     route.get("model") or "(无模型)",
                     route.get("reasoning_effort") or "默认",
-                    prompt_probe.wire_suffix_label(route.get('wire_api')),
+                    prompt_probe.wire_suffix_label(route.get("wire_api")),
                     "等待",
                     "",
                 ),
             )
             self.rows.append({"item": item, "route": route, "detail": "", "path": ""})
         self.protocol("WM_DELETE_WINDOW", self._close)
+        self.after(30, self._drain_ui_queue)
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                try:
+                    callback, args = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback(*args)
+                except Exception:
+                    pass
+        finally:
+            try:
+                if self.winfo_exists():
+                    self.after(30, self._drain_ui_queue)
+            except tk.TclError:
+                pass
 
     def edit_prompt(self):
         if self._running:
@@ -186,6 +240,9 @@ class PromptTestDialog(tk.Toplevel):
     def start(self):
         if self._running:
             return
+        if not self.rows:
+            messagebox.showinfo("没有路线", "请先在 Codex 专区选择一条或多条路线。", parent=self)
+            return
         settings = prompt_probe.load_prompt_settings()
         if prompt_probe.prompt_mentions_git_publish(settings["prompt"]) and not messagebox.askyesno(
             "提示词包含提交或推送",
@@ -193,13 +250,27 @@ class PromptTestDialog(tk.Toplevel):
             parent=self,
         ):
             return
+        workers = _worker_limit(self.workers_var.get(), len(self.rows))
         self._running = True
         self._stop = False
-        threading.Thread(target=self._run, daemon=True).start()
+        with self._progress_lock:
+            self._active_count = 0
+            self._done_count = 0
+            self._batch_total = len(self.rows)
+            self._batch_workers = workers
+        self._batch = {
+            "settings": settings,
+            "binary": self.binary_var.get(),
+            "hidden": bool(self.hidden_var.get()),
+            "workers": workers,
+        }
+        self._reset_rows()
+        self.status_var.set(f"并发 {workers} 路，共 {len(self.rows)} 条，正在启动…")
+        threading.Thread(target=self._run, args=(self._batch,), daemon=True).start()
 
     def stop(self):
         self._stop = True
-        self.status_var.set("正在停止当前进程。")
+        self.status_var.set("正在停止所有运行中的进程。")
         self._kill_process()
 
     def _close(self):
@@ -207,30 +278,111 @@ class PromptTestDialog(tk.Toplevel):
         self._kill_process()
         self.destroy()
 
-    def _kill_process(self):
-        process = self._process
+    def _post(self, callback, *args):
+        # Tk objects must only be touched by the main thread. Worker threads
+        # enqueue updates; the polling callback above drains them in the GUI.
+        if threading.current_thread() is threading.main_thread():
+            try:
+                callback(*args)
+            except tk.TclError:
+                pass
+            return
+        self._ui_queue.put((callback, args))
+
+    def _set_global_status(self, text):
+        self._post(self.status_var.set, text)
+
+    def _reset_rows(self):
+        for row in self.rows:
+            row["detail"] = ""
+            row["path"] = ""
+            self._set_status(row, "等待", "")
+
+    def _track_process(self, row, process):
+        with self._process_lock:
+            self._processes[row["item"]] = process
+        if self._stop:
+            self._kill_process(process)
+
+    def _untrack_process(self, row, process):
+        with self._process_lock:
+            if self._processes.get(row["item"]) is process:
+                del self._processes[row["item"]]
+
+    def _kill_process(self, process=None):
+        if process is None:
+            with self._process_lock:
+                targets = list(self._processes.values())
+        else:
+            targets = [process]
+        for target in targets:
+            self._kill_one(target)
+
+    def _kill_one(self, process):
         if process is None or process.poll() is not None:
             return
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                capture_output=True,
-                check=False,
-            )
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True,
+                    check=False,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                process.terminate()
+        except OSError:
+            pass
+
+    def _mark_started(self):
+        with self._progress_lock:
+            self._active_count += 1
+            active = self._active_count
+            done = self._done_count
+            total = self._batch_total
+            workers = self._batch_workers
+        self._set_global_status(f"并发 {workers} 路 · 进行中 {active} · 已完成 {done}/{total}")
+
+    def _mark_finished(self):
+        with self._progress_lock:
+            self._active_count = max(0, self._active_count - 1)
+            self._done_count = min(self._batch_total, self._done_count + 1)
+            active = self._active_count
+            done = self._done_count
+            total = self._batch_total
+            workers = self._batch_workers
+        if self._stop:
+            self._set_global_status(f"正在停止 · 进行中 {active} · 已结束 {done}/{total}")
         else:
-            process.terminate()
+            self._set_global_status(f"并发 {workers} 路 · 进行中 {active} · 已完成 {done}/{total}")
 
-    def _run(self):
+    def _run(self, batch):
         total = len(self.rows)
-        for offset, row in enumerate(self.rows, start=1):
-            if self._stop:
-                self.after(0, self._mark_remaining, offset - 1, "已停止")
-                break
-            self.after(0, self.status_var.set, f"测试中 {offset}/{total}：{row['route'].get('name') or '未命名'}")
-            self._run_one(row)
-        self.after(0, self._finish)
+        workers = batch["workers"]
+        if total:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="prompt-test") as pool:
+                futures = [pool.submit(self._run_one, row, batch) for row in self.rows]
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
+        self._post(self._finish)
 
-    def _run_one(self, row):
+    def _run_one(self, row, batch):
+        if self._stop:
+            self._finish_row(row, "已停止", "", "测试已停止，这条还没有开始。")
+            self._mark_finished()
+            return
+        self._mark_started()
+        try:
+            self._run_one_inner(row, batch)
+        except Exception as exc:
+            self._finish_row(row, "失败", row.get("path", ""), f"内部错误：{exc}")
+        finally:
+            self._mark_finished()
+
+    def _run_one_inner(self, row, batch):
         route = dict(row["route"])
         route["wire_api"] = prompt_probe.normalize_wire_suffix(route.get("wire_api"), default="/responses")
         route["base_url"] = str(route.get("base_url") or "").strip().rstrip("/")
@@ -238,10 +390,14 @@ class PromptTestDialog(tk.Toplevel):
         if problem:
             self._finish_row(row, "已跳过", "", problem)
             return
+        problem = prompt_probe.prompt_wire_problem(route)
+        if problem:
+            self._finish_row(row, "已跳过", "", problem)
+            return
         if not str(route.get("model") or "").strip():
             self._finish_row(row, "已跳过", "", "这条路线没有模型名，无法做提示词测试。")
             return
-        settings = prompt_probe.load_prompt_settings()
+        settings = batch["settings"]
         directory = Path(settings["output_dir"])
         try:
             output_path = prompt_gallery.allocate_prompt_output(directory, route)
@@ -249,9 +405,9 @@ class PromptTestDialog(tk.Toplevel):
             self._finish_row(row, "失败", "", f"无法创建输出目录：{exc}")
             return
         prompt = prompt_probe.render_prompt(settings["prompt"], route, output_path)
-        hidden = bool(self.hidden_var.get())
+        hidden = batch["hidden"]
         try:
-            command = self.command_builder(self.binary_var.get(), route, prompt, output_path.parent, hidden)
+            command = self.command_builder(batch["binary"], route, prompt, output_path.parent, hidden)
         except Exception as exc:
             self._finish_row(row, "失败", str(output_path), str(exc))
             return
@@ -261,10 +417,15 @@ class PromptTestDialog(tk.Toplevel):
         except OSError as exc:
             self._finish_row(row, "失败", str(output_path), str(exc))
             return
-        self._process = process
-        output = self._read_process(process, hidden, output_path, row)
+        self._track_process(row, process)
+        try:
+            output = self._read_process(process, hidden, output_path, row)
+        except Exception:
+            self._kill_process(process)
+            raise
+        finally:
+            self._untrack_process(row, process)
         code = process.poll()
-        self._process = None
         output = self._scrub(route, output)
         if self._stop:
             status = "已停止"
@@ -335,7 +496,7 @@ class PromptTestDialog(tk.Toplevel):
                     if size > 0 and size == last_size:
                         stable_since = stable_since or time.monotonic()
                         if time.monotonic() - stable_since >= settle_seconds:
-                            self._kill_process()
+                            self._kill_process(process)
                             try:
                                 output, _stderr = process.communicate(timeout=10)
                             except subprocess.TimeoutExpired:
@@ -345,7 +506,7 @@ class PromptTestDialog(tk.Toplevel):
                         last_size = size
                         stable_since = None
                 if time.monotonic() >= deadline:
-                    self._kill_process()
+                    self._kill_process(process)
                     try:
                         output, _stderr = process.communicate(timeout=10)
                     except subprocess.TimeoutExpired:
@@ -385,13 +546,13 @@ class PromptTestDialog(tk.Toplevel):
                     route.get("name") or "未命名",
                     route.get("model") or "",
                     route.get("reasoning_effort") or "默认",
-                    prompt_probe.wire_suffix_label(route.get('wire_api')),
+                    prompt_probe.wire_suffix_label(route.get("wire_api")),
                     status,
                     path,
                 ),
             )
 
-        self.after(0, apply)
+        self._post(apply)
 
     def _mark_remaining(self, start, status):
         for row in self.rows[start:]:
@@ -401,8 +562,20 @@ class PromptTestDialog(tk.Toplevel):
 
     def _finish(self):
         self._running = False
-        if self.winfo_exists() and not self._stop:
-            self.status_var.set("本轮结束。对比页已按天更新，点“打开对比页”用滚轮看哪个站点更好。")
+        if not self.winfo_exists():
+            return
+        with self._progress_lock:
+            done = self._done_count
+            total = self._batch_total
+            workers = self._batch_workers
+        if self._stop:
+            self._mark_remaining(0, "已停止")
+            self.status_var.set(f"已停止。本轮结束 {done}/{total} 条。")
+        else:
+            self.status_var.set(
+                f"本轮结束：{done}/{total} 条，并发 {workers} 路。"
+                "对比页已按天更新，点“打开对比页”查看最新结果。"
+            )
 
     def _show_selected(self):
         selected = self.tree.selection()
